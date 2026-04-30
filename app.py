@@ -1,9 +1,20 @@
 import re
 import unicodedata
 from datetime import date
+import os
 import streamlit as st
+import anthropic
 from fpdf import FPDF
 from research_agent import run_agent
+
+_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+_SYSTEM_PROMPT = (
+    "You are a research assistant helping a computational biologist "
+    "understand scientific papers. Answer questions clearly and "
+    "concisely based on the paper summary in the conversation. "
+    "If asked something not covered in the summary, say so clearly."
+)
 
 
 def _build_pdf(pmid: str, summary: str) -> bytes:
@@ -219,6 +230,9 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
 pmid = st.text_input("PubMed ID")
 
 if st.button("Fetch & Summarise"):
@@ -226,8 +240,13 @@ if st.button("Fetch & Summarise"):
         st.warning("Please enter a PubMed ID.")
     else:
         with st.spinner("Fetching and summarising..."):
-            st.session_state["summary"] = run_agent(pmid.strip())
+            summary = run_agent(pmid.strip())
+            st.session_state["summary"] = summary
             st.session_state["pmid"] = pmid.strip()
+            st.session_state.messages = [
+                {"role": "user", "content": f"Fetch and summarise PMID {pmid.strip()}"},
+                {"role": "assistant", "content": summary},
+            ]
 
 if "summary" in st.session_state:
     summary = st.session_state["summary"]
@@ -261,3 +280,27 @@ if "summary" in st.session_state:
             mime="application/pdf",
             use_container_width=True,
         )
+
+    st.markdown('<hr class="teal-divider">', unsafe_allow_html=True)
+
+    for msg in st.session_state.messages[2:]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    if question := st.chat_input("Ask a follow-up question about this paper..."):
+        st.session_state.messages.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                api_response = _client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=1024,
+                    system=_SYSTEM_PROMPT,
+                    messages=st.session_state.messages,
+                )
+                answer = api_response.content[0].text
+            st.markdown(answer)
+
+        st.session_state.messages.append({"role": "assistant", "content": answer})
