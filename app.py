@@ -240,9 +240,10 @@ if st.button("Fetch & Summarise"):
         st.warning("Please enter a PubMed ID.")
     else:
         with st.spinner("Fetching and summarising..."):
-            summary = run_agent(pmid.strip())
+            summary, fetched_text = run_agent(pmid.strip())
             st.session_state["summary"] = summary
             st.session_state["pmid"] = pmid.strip()
+            st.session_state["fetched_text"] = fetched_text
             st.session_state.messages = [
                 {"role": "user", "content": f"Fetch and summarise PMID {pmid.strip()}"},
                 {"role": "assistant", "content": summary},
@@ -258,6 +259,12 @@ if "summary" in st.session_state:
         f'<div class="summary-card">{summary}</div>',
         unsafe_allow_html=True,
     )
+
+    fetched_text = st.session_state.get("fetched_text", "")
+    if "[Source: Full text" in fetched_text:
+        st.caption("📄 Full text retrieved via PubMed Central")
+    elif "[Source: Abstract only" in fetched_text:
+        st.caption("📋 Abstract only — full text not available in PMC")
 
     st.markdown('<hr class="teal-divider">', unsafe_allow_html=True)
 
