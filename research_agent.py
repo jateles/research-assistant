@@ -105,7 +105,7 @@ def get_pmcid(pmid: str):
         return None
 
 
-def fetch_full_text(pmid: str) -> str:
+def fetch_full_text(pmid: str, debug: bool = False) -> str:
     """
     Fetches the best available text for a paper: full PMC text if accessible,
     otherwise the PubMed abstract.
@@ -117,6 +117,8 @@ def fetch_full_text(pmid: str) -> str:
 
     Args:
         pmid (str): The PubMed ID of the paper, e.g. "37651234".
+        debug (bool): When True, prints raw XML length, a preview of the XML,
+                      per-section character counts, and the final text length.
 
     Returns:
         str: A multi-section plain-text string with labelled headers
@@ -141,8 +143,30 @@ def fetch_full_text(pmid: str) -> str:
             )
             response.raise_for_status()
 
+            if debug:
+                print(f"[debug] Raw XML length: {len(response.text)} characters")
+                print(f"[debug] First 2000 chars of raw XML:\n{response.text[:2000]}")
+
             # Parse the XML string into an ElementTree for XPath queries.
             root = ET.fromstring(response.text)
+
+            # ── BUG 1: Verify the XML belongs to the requested paper ─────────
+            # PMC's elink mapping can occasionally return the wrong PMCID.
+            # Cross-check by reading the PMID embedded in the article XML itself.
+            pmid_tag = root.find('.//article-id[@pub-id-type="pmid"]')
+            if pmid_tag is not None:
+                if pmid_tag.text and pmid_tag.text.strip() != pmid:
+                    print(
+                        f"[warning] XML PMID mismatch: requested {pmid}, "
+                        f"got {pmid_tag.text.strip()}. Falling back to abstract."
+                    )
+                    result = fetch_abstract(pmid) + "\n\n[Source: Abstract only - PMID mismatch]"
+                    if debug:
+                        print(f"[debug] Final text length (PMID mismatch fallback): {len(result)} characters")
+                    return result
+            else:
+                if debug:
+                    print("[debug] No PMID tag found in XML; proceeding with extraction (uncertain match)")
 
             # Accumulate named sections; we join them later with double newlines.
             sections = []
@@ -155,6 +179,8 @@ def fetch_full_text(pmid: str) -> str:
                 text = " ".join(" ".join(node.itertext()) for node in abstracts).strip()
                 if text:
                     sections.append(f"ABSTRACT\n{text}")
+                    if debug:
+                        print(f"[debug] ABSTRACT: {len(text)} characters")
 
             # ── Extract named body sections ──────────────────────────────────
             # Each tuple maps a display label to a lambda that recognises
@@ -178,6 +204,8 @@ def fetch_full_text(pmid: str) -> str:
                         text = " ".join(sec.itertext()).strip()
                         if text:
                             sections.append(f"{label}\n{text}")
+                            if debug:
+                                print(f"[debug] {label}: {len(text)} characters")
                         break
 
             # ── Extract figure captions ──────────────────────────────────────
@@ -196,22 +224,44 @@ def fetch_full_text(pmid: str) -> str:
                     if entry:
                         fig_lines.append(entry)
                 if fig_lines:
-                    sections.append("FIGURES\n" + "\n".join(fig_lines))
+                    figures_text = "\n".join(fig_lines)
+                    sections.append("FIGURES\n" + figures_text)
+                    if debug:
+                        print(f"[debug] FIGURES: {len(figures_text)} characters")
 
-            # Catch-all fallback: structured section extraction above relies on
-            # JATS title conventions that vary across publishers. If nothing was
-            # captured, walk every element in the tree and collect any text
-            # node longer than 20 characters. Less structured, but guarantees
-            # we return something when the XML has content but non-standard tags.
+            # ── BUG 2: Tiered fallback for non-standard section structure ────
+            # If structured section extraction found nothing, try extracting
+            # <body> text directly before resorting to the full-tree catch-all.
             if not sections:
+                body_el = root.find(".//body")
+                if body_el is not None:
+                    body_chunks = [
+                        chunk.strip()
+                        for el in body_el.iter()
+                        for chunk in (el.text, el.tail)
+                        if chunk and len(chunk.strip()) > 30
+                    ]
+                    if body_chunks:
+                        sections.append(" ".join(body_chunks))
+                        if debug:
+                            print(f"[debug] Extraction method: <body> fallback, {len(sections[0])} characters")
+
+            # Last-resort catch-all: walk every element in the entire tree.
+            # Less structured than body extraction but guarantees we return
+            # something when the XML has content but non-standard tags.
+            if not sections:
+                if debug:
+                    print("[debug] Extraction method: full-tree catch-all")
                 raw_chunks = [
-                    chunk
+                    chunk.strip()
                     for el in root.iter()
                     for chunk in (el.text, el.tail)
                     if chunk and len(chunk.strip()) > 20
                 ]
                 if raw_chunks:
-                    sections.append(" ".join(chunk.strip() for chunk in raw_chunks))
+                    sections.append(" ".join(raw_chunks))
+            elif debug and any(s.startswith(("ABSTRACT", "INTRODUCTION", "METHODS", "RESULTS", "DISCUSSION", "FIGURES")) for s in sections):
+                print("[debug] Extraction method: structured section extraction")
 
             # Join sections with blank lines and append a provenance footer
             # so Claude and the user know the text came from PMC full text.
@@ -221,19 +271,28 @@ def fetch_full_text(pmid: str) -> str:
             # usable prose (e.g. a metadata-only record). Fall back to the
             # abstract so Claude always has something meaningful to summarise.
             if len(output) < 200:
-                return (
-                    fetch_abstract(pmid)
-                    + "\n\n[Source: Abstract only - full text parse failed]"
-                )
+                result = fetch_abstract(pmid) + "\n\n[Source: Abstract only - full text parse failed]"
+                if debug:
+                    print(f"[debug] Final text length (abstract fallback): {len(result)} characters")
+                return result
 
-            return output + "\n\n[Source: Full text via PubMed Central]"
+            result = output + "\n\n[Source: Full text via PubMed Central]"
+            if debug:
+                print(f"[debug] Final text length: {len(result)} characters")
+            return result
         except Exception:
             # Any XML parse error, HTTP error, or unexpected structure means
             # we fall back gracefully rather than crashing the agent loop.
-            return fetch_abstract(pmid) + "\n\n[Source: Abstract only - full text not available]"
+            result = fetch_abstract(pmid) + "\n\n[Source: Abstract only - full text not available]"
+            if debug:
+                print(f"[debug] Final text length (exception fallback): {len(result)} characters")
+            return result
     else:
         # No PMCID found — the paper has no free full-text deposit in PMC.
-        return fetch_abstract(pmid) + "\n\n[Source: Abstract only - full text not available]"
+        result = fetch_abstract(pmid) + "\n\n[Source: Abstract only - full text not available]"
+        if debug:
+            print(f"[debug] Final text length (no PMCID fallback): {len(result)} characters")
+        return result
 
 
 # ── Tool definitions ─────────────────────────────────────────────────────────
@@ -408,6 +467,10 @@ def main():
     # needing to supply an ID every time.
     pubmed_id = sys.argv[1] if len(sys.argv) > 1 else "37651234"
     print("Research agent ready")
+
+    text = fetch_full_text("39486399", debug=True)
+    print(f"fetch_full_text result length: {len(text)} characters")
+
     # Discard the raw fetched_text (_) — the CLI only needs the final summary.
     summary, _ = run_agent(pubmed_id)
     print(summary)
