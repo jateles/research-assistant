@@ -389,7 +389,12 @@ def run_agent(pubmed_id: str) -> tuple[str, str]:
     if response.stop_reason == "tool_use":
         # Extract the tool_use content block. There will be exactly one because
         # we only defined one tool and the request implies a single paper lookup.
-        tool_block = next(b for b in response.content if b.type == "tool_use")
+        # next() raises StopIteration if no match found —
+        # always provide a default when the API response
+        # structure cannot be guaranteed
+        tool_block = next((b for b in response.content if b.type == "tool_use"), None)
+        if not tool_block:
+            return "Unable to generate summary — the model returned an unexpected response. Please try again.", ""
 
         # Claude may normalise or re-interpret the PMID (e.g. strip whitespace),
         # so we use the ID that Claude passed to the tool rather than the raw
@@ -438,7 +443,12 @@ def run_agent(pubmed_id: str) -> tuple[str, str]:
 
         # Extract the plain-text summary from the final response. We skip any
         # non-text blocks (e.g. residual tool_use blocks) with the type check.
-        summary = next(b.text for b in final_response.content if b.type == "text")
+        # next() raises StopIteration if no match found —
+        # always provide a default when the API response
+        # structure cannot be guaranteed
+        summary = next((b.text for b in final_response.content if b.type == "text"), None)
+        if not summary:
+            summary = "Unable to generate summary — the model returned an unexpected response. Please try again."
         return summary, fetched_text
 
     # Fallback: Claude answered without calling the tool (stop_reason="end_turn").
