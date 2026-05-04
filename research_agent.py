@@ -198,9 +198,34 @@ def fetch_full_text(pmid: str) -> str:
                 if fig_lines:
                     sections.append("FIGURES\n" + "\n".join(fig_lines))
 
+            # Catch-all fallback: structured section extraction above relies on
+            # JATS title conventions that vary across publishers. If nothing was
+            # captured, walk every element in the tree and collect any text
+            # node longer than 20 characters. Less structured, but guarantees
+            # we return something when the XML has content but non-standard tags.
+            if not sections:
+                raw_chunks = [
+                    chunk
+                    for el in root.iter()
+                    for chunk in (el.text, el.tail)
+                    if chunk and len(chunk.strip()) > 20
+                ]
+                if raw_chunks:
+                    sections.append(" ".join(chunk.strip() for chunk in raw_chunks))
+
             # Join sections with blank lines and append a provenance footer
             # so Claude and the user know the text came from PMC full text.
             output = "\n\n".join(s for s in sections if s)
+
+            # Empty or near-empty output means the XML existed but contained no
+            # usable prose (e.g. a metadata-only record). Fall back to the
+            # abstract so Claude always has something meaningful to summarise.
+            if len(output) < 200:
+                return (
+                    fetch_abstract(pmid)
+                    + "\n\n[Source: Abstract only - full text parse failed]"
+                )
+
             return output + "\n\n[Source: Full text via PubMed Central]"
         except Exception:
             # Any XML parse error, HTTP error, or unexpected structure means
