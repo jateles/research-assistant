@@ -631,6 +631,29 @@ def pubmed_author_search(author_name: str, limit: int = 10) -> list[dict]:
     return results
 
 
+def check_full_text_batch(papers: list[dict]) -> list[dict]:
+    """
+    Refreshes PMC full-text availability for a list of papers.
+
+    Called on the top-N ranked papers before the curation screen so the UI
+    can show accurate "Full text available" / "Abstract only" badges. Running
+    this on all candidates during scouting would add too much latency; calling
+    it on the ranked shortlist keeps the wait acceptable.
+
+    Args:
+        papers (list[dict]): Normalised paper dicts, each with a "pmid" key.
+
+    Returns:
+        list[dict]: The same dicts with has_full_text (bool) and pmcid
+                    (str or None) updated in place.
+    """
+    for paper in papers:
+        pmcid = get_pmcid(paper["pmid"])
+        paper["pmcid"] = pmcid
+        paper["has_full_text"] = pmcid is not None
+    return papers
+
+
 def literature_scout(anchor: dict) -> list:
     """
     Agent 1: Fetches candidate papers from multiple sources based on the anchor.

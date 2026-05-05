@@ -33,8 +33,8 @@ import streamlit as st
 import anthropic
 import fitz  # PyMuPDF — used only to check availability; extraction is in research_agent
 from fpdf import FPDF
-from research_agent import run_agent, summarise_pdf
-from landscape_agent import anchor_builder
+from research_agent import run_agent, summarise_pdf, get_pmcid
+from landscape_agent import anchor_builder, literature_scout, relevance_ranker
 
 # Initialise the Anthropic client once at module level. Streamlit re-imports
 # this module on each run, but Python's module cache means this line only
@@ -1010,13 +1010,428 @@ elif mode == "Literature landscape":
                 st.rerun()
 
     # ──────────────────────────────────────────────────────────────────────────
-    # STEPS 3 and 4: Placeholders — full implementation in Session 2 / 3
+    # STEP 3: Paper curation screen
+    # Agent 1 (literature_scout) and Agent 2 (relevance_ranker) run here.
+    # Results are cached in session state so they survive Streamlit reruns.
     # ──────────────────────────────────────────────────────────────────────────
-    elif st.session_state.landscape_step in [3, 4]:
-        st.info(
-            "Literature Scout, Relevance Ranker and Synthesis Agent "
-            "coming in the next session."
+    elif st.session_state.landscape_step == 3:
+
+        anchor = st.session_state.landscape_anchor
+
+        # Run scout and ranker only once per anchor — results are stored in
+        # session state and reused on every subsequent rerun of this step.
+        if "landscape_candidates" not in st.session_state:
+
+            with st.status(
+                "Searching literature...",
+                expanded=True
+            ) as status:
+
+                st.write(
+                    "Querying Semantic Scholar and PubMed — "
+                    "this takes 20-30 seconds..."
+                )
+
+                # Agent 1: fetch candidate papers from all enabled sources.
+                candidates = literature_scout(anchor)
+                st.write(f"Found {len(candidates)} candidate papers")
+
+                # Agent 2: score and sort candidates by relevance to anchor.
+                st.write("Ranking by relevance to your anchor...")
+                ranked = relevance_ranker(candidates, anchor)
+                st.write("Ranking complete")
+
+                # Deferred full-text check — only verify the top 20 ranked
+                # papers rather than all candidates to keep latency acceptable.
+                st.write("Checking full text availability...")
+                from landscape_agent import check_full_text_batch
+                ranked = check_full_text_batch(ranked[:20])
+
+                status.update(
+                    label=f"Found {len(ranked)} relevant papers",
+                    state="complete"
+                )
+
+            # Persist results so this block doesn't re-execute on rerun.
+            st.session_state.landscape_candidates = ranked
+
+            # Pre-select the top 5 papers by default; user can change this.
+            top_pmids = {p["pmid"] for p in ranked[:5]}
+            st.session_state.selected_pmids = top_pmids
+            st.session_state.manual_papers = []
+            st.session_state.paper_pdfs = {}
+
+        # Retrieve the stored candidate list for rendering below.
+        candidates = st.session_state.landscape_candidates
+
+        st.markdown("## Select papers for your landscape")
+        st.caption(
+            "Agent 2 has ranked these papers by relevance. "
+            "Select which to include. Add your own PMIDs below."
         )
-        if st.button("← Back to anchor"):
-            st.session_state.landscape_step = 2
+
+        # Collapsible reminder of the confirmed anchor so the user can
+        # cross-check paper relevance against their original scope.
+        with st.expander("Your anchor", expanded=False):
+            st.markdown(
+                f"**Core question:** {anchor.get('core_question', '')}"
+            )
+            st.markdown(
+                f"**Scope:** {anchor.get('field_scope', '')}"
+            )
+
+        st.markdown("---")
+
+        # Two-column layout: paper list on the left (wider),
+        # selection summary and action buttons on the right.
+        left_col, right_col = st.columns([3, 2])
+
+        with left_col:
+
+            st.markdown("### Ranked papers")
+
+            # Human-readable badge for each retrieval relationship type.
+            badge_labels = {
+                "cited_by_anchor": "🟣 Cites this paper",
+                "cites_anchor":    "🔵 Cited by this paper",
+                "same_author":     "🟡 Same author",
+                "keyword_match":   "⚪ Keyword match",
+            }
+
+            # ── Section 1: Top 20 papers — always visible ─────────────────
+            for paper in candidates[:20]:
+                pmid = paper["pmid"]
+
+                with st.container(border=True):
+
+                    # Top row: checkbox on the left, title and authors on the right.
+                    col_check, col_title = st.columns([1, 8])
+
+                    with col_check:
+                        # Read current selection state from the set; write back
+                        # after the checkbox renders so the set stays in sync.
+                        is_selected = pmid in st.session_state.selected_pmids
+                        checked = st.checkbox(
+                            "Select",
+                            value=is_selected,
+                            key=f"check_{pmid}",
+                            label_visibility="collapsed",
+                        )
+                        if checked:
+                            st.session_state.selected_pmids.add(pmid)
+                        else:
+                            st.session_state.selected_pmids.discard(pmid)
+
+                    with col_title:
+                        st.markdown(f"**{paper['title']}**")
+                        st.caption(
+                            f"{paper['authors']} · "
+                            f"{paper['journal'] or 'Unknown journal'} · "
+                            f"{paper['year'] or 'Unknown year'}"
+                        )
+
+                    # Bottom row: relationship badge, relevance score bar,
+                    # full-text status with optional inline PDF upload.
+                    col_badge, col_score, col_ft = st.columns([3, 2, 3])
+
+                    with col_badge:
+                        st.caption(
+                            badge_labels.get(paper["relationship"], "⚪ Found")
+                        )
+                        if paper.get("intent"):
+                            st.caption(f"Citation intent: {paper['intent']}")
+
+                    with col_score:
+                        score = paper.get("relevance_score", 0)
+                        st.caption(f"Relevance: {score}/100")
+                        st.progress(score / 100)
+
+                    with col_ft:
+                        if paper.get("has_full_text"):
+                            st.caption("📄 Full text available")
+                            upload_label = "Upload PDF for richer analysis"
+                        else:
+                            st.caption("📋 Abstract only")
+                            upload_label = "Upload PDF"
+
+                        uploaded_pdf = st.file_uploader(
+                            upload_label,
+                            type="pdf",
+                            key=f"pdf_{pmid}",
+                            label_visibility="collapsed",
+                        )
+                        if uploaded_pdf:
+                            pdf_bytes = uploaded_pdf.read()
+                            if pdf_bytes:
+                                st.session_state.paper_pdfs[pmid] = pdf_bytes
+                                st.caption("✓ PDF uploaded")
+
+            # ── Section 2: Remaining papers — collapsed expander ───────────
+            remaining = candidates[20:]
+            if remaining:
+                with st.expander(
+                    f"Show {len(remaining)} more papers",
+                    expanded=False,
+                ):
+                    for paper in remaining:
+                        pmid = paper["pmid"]
+
+                        with st.container(border=True):
+
+                            col_check, col_title = st.columns([1, 8])
+
+                            with col_check:
+                                is_selected = pmid in st.session_state.selected_pmids
+                                checked = st.checkbox(
+                                    "Select",
+                                    value=is_selected,
+                                    key=f"check_{pmid}",
+                                    label_visibility="collapsed",
+                                )
+                                if checked:
+                                    st.session_state.selected_pmids.add(pmid)
+                                else:
+                                    st.session_state.selected_pmids.discard(pmid)
+
+                            with col_title:
+                                st.markdown(f"**{paper['title']}**")
+                                st.caption(
+                                    f"{paper['authors']} · "
+                                    f"{paper['journal'] or 'Unknown journal'} · "
+                                    f"{paper['year'] or 'Unknown year'}"
+                                )
+
+                            col_badge, col_score, col_ft = st.columns([3, 2, 3])
+
+                            with col_badge:
+                                st.caption(
+                                    badge_labels.get(paper["relationship"], "⚪ Found")
+                                )
+                                if paper.get("intent"):
+                                    st.caption(f"Citation intent: {paper['intent']}")
+
+                            with col_score:
+                                score = paper.get("relevance_score", 0)
+                                st.caption(f"Relevance: {score}/100")
+                                st.progress(score / 100)
+
+                            with col_ft:
+                                if paper.get("has_full_text"):
+                                    st.caption("📄 Full text available")
+                                    upload_label = "Upload PDF for richer analysis"
+                                else:
+                                    st.caption("📋 Abstract only")
+                                    upload_label = "Upload PDF"
+
+                                uploaded_pdf = st.file_uploader(
+                                    upload_label,
+                                    type="pdf",
+                                    key=f"pdf_{pmid}",
+                                    label_visibility="collapsed",
+                                )
+                                if uploaded_pdf:
+                                    pdf_bytes = uploaded_pdf.read()
+                                    if pdf_bytes:
+                                        st.session_state.paper_pdfs[pmid] = pdf_bytes
+                                        st.caption("✓ PDF uploaded")
+
+            # ── Manually added papers ─────────────────────────────────────
+            # Rendered below the ranked list once any PMIDs have been resolved
+            # via the "Resolve and add papers" button.
+            manual_papers = st.session_state.get("manual_papers", [])
+            if manual_papers:
+                st.markdown("### Added manually")
+                for paper in manual_papers:
+                    pmid = paper["pmid"]
+                    with st.container(border=True):
+                        col_check, col_title = st.columns([1, 8])
+                        with col_check:
+                            checked = st.checkbox(
+                                "Select",
+                                value=pmid in st.session_state.selected_pmids,
+                                key=f"check_manual_{pmid}",
+                                label_visibility="collapsed",
+                            )
+                            if checked:
+                                st.session_state.selected_pmids.add(pmid)
+                            else:
+                                st.session_state.selected_pmids.discard(pmid)
+                        with col_title:
+                            st.markdown(f"**{paper['title']}**")
+                            st.caption(
+                                f"{paper.get('authors', '')} · Added manually"
+                            )
+                        uploaded_pdf = st.file_uploader(
+                            "Upload PDF for richer analysis"
+                            if paper.get("has_full_text")
+                            else "Upload PDF",
+                            type="pdf",
+                            key=f"pdf_manual_{pmid}",
+                            label_visibility="collapsed",
+                        )
+                        if uploaded_pdf:
+                            pdf_bytes = uploaded_pdf.read()
+                            if pdf_bytes:
+                                st.session_state.paper_pdfs[pmid] = pdf_bytes
+                                st.caption("✓ PDF uploaded")
+
+            # ── Add your own papers ───────────────────────────────────────
+            st.markdown("---")
+            st.markdown("### Add your own papers")
+            st.caption("Paste PMIDs one per line or comma separated")
+
+            manual_input = st.text_area(
+                "PMIDs to add",
+                height=80,
+                placeholder="23990771\n26040267\n28212749",
+                label_visibility="collapsed",
+            )
+
+            if st.button("Resolve and add papers", use_container_width=True):
+                if manual_input.strip():
+                    # Accept newlines, commas, or whitespace as separators.
+                    raw_pmids = re.split(r'[\n,\s]+', manual_input.strip())
+                    # Keep only 7-8 digit strings — anything else is not a PMID.
+                    valid_pmids = [
+                        p.strip() for p in raw_pmids
+                        if re.match(r'^\d{7,8}$', p.strip())
+                    ]
+
+                    if valid_pmids:
+                        with st.spinner(
+                            f"Resolving {len(valid_pmids)} papers..."
+                        ):
+                            from research_agent import fetch_abstract
+                            new_papers = []
+                            # Build lookup set once to avoid O(n²) membership checks.
+                            existing_pmids = {p["pmid"] for p in candidates}
+
+                            for pmid in valid_pmids:
+                                if pmid in existing_pmids:
+                                    st.caption(f"PMID {pmid} already in list")
+                                    continue
+
+                                try:
+                                    abstract = fetch_abstract(pmid)
+                                    # Extract title: first non-empty line over 20
+                                    # chars that doesn't start with a digit.
+                                    lines = [
+                                        l.strip()
+                                        for l in abstract.split("\n")
+                                        if l.strip()
+                                    ]
+                                    title = next(
+                                        (
+                                            l for l in lines
+                                            if len(l) > 20
+                                            and not l[0].isdigit()
+                                        ),
+                                        f"PMID {pmid}",
+                                    )
+                                    pmcid = get_pmcid(pmid)
+                                    new_papers.append({
+                                        "pmid": pmid,
+                                        "title": title,
+                                        "authors": "",
+                                        "journal": "",
+                                        "year": 0,
+                                        "relationship": "manual",
+                                        "intent": "",
+                                        "has_full_text": pmcid is not None,
+                                        "pmcid": pmcid,
+                                        "relevance_score": 100,
+                                        "relevance_rationale": "Added manually",
+                                    })
+                                    # Auto-select every manually added paper.
+                                    st.session_state.selected_pmids.add(pmid)
+                                except Exception as e:
+                                    st.warning(
+                                        f"Could not resolve PMID {pmid}: {e}"
+                                    )
+
+                        if new_papers:
+                            st.session_state.manual_papers.extend(new_papers)
+                            st.success(f"Added {len(new_papers)} papers")
+                            st.rerun()
+                    else:
+                        st.warning(
+                            "No valid PMIDs found. "
+                            "PMIDs are 7-8 digit numbers."
+                        )
+
+        with right_col:
+
+            st.markdown("### Your selection")
+
+            # Count selected papers split by source for the metrics display.
+            n_selected = len(st.session_state.selected_pmids)
+            n_ranked = len([
+                p for p in candidates
+                if p["pmid"] in st.session_state.selected_pmids
+            ])
+            n_manual = len([
+                p for p in st.session_state.get("manual_papers", [])
+                if p["pmid"] in st.session_state.selected_pmids
+            ])
+
+            # Summary metrics card.
+            with st.container(border=True):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Selected", n_selected)
+                with col2:
+                    st.metric("From ranked", n_ranked)
+                if n_manual > 0:
+                    st.metric("Added manually", n_manual)
+
+            st.markdown("---")
+
+            # Disable the generate button until at least 2 papers are selected —
+            # Agent 3 needs a minimum of 2 to produce a meaningful landscape.
+            generate_disabled = n_selected < 2
+            if generate_disabled:
+                st.caption(
+                    "Select at least 2 papers to generate your landscape"
+                )
+
+            if st.button(
+                "Generate landscape →",
+                type="primary",
+                use_container_width=True,
+                disabled=generate_disabled,
+            ):
+                st.session_state.landscape_step = 4
+                st.rerun()
+
+            if st.button("Use all ranked papers", use_container_width=True):
+                # Select every candidate from the ranked list in one click.
+                st.session_state.selected_pmids = {
+                    p["pmid"] for p in candidates
+                }
+                st.rerun()
+
+            st.markdown("---")
+            st.markdown("**What Agent 3 will receive:**")
+            st.caption(
+                f"• {n_selected} selected papers\n"
+                f"• Your confirmed anchor document\n"
+                f"• Full text where available, abstracts otherwise"
+            )
+
+            # Back button clears cached candidates so the scout and ranker
+            # re-run if the user edits the anchor and returns to Step 3.
+            st.markdown("---")
+            if st.button("← Back to anchor", use_container_width=True):
+                if "landscape_candidates" in st.session_state:
+                    del st.session_state.landscape_candidates
+                st.session_state.landscape_step = 2
+                st.rerun()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 4: Placeholder — Synthesis Agent coming in Session 3
+    # ──────────────────────────────────────────────────────────────────────────
+    elif st.session_state.landscape_step == 4:
+        st.info("Synthesis Agent coming in Session 3.")
+        if st.button("← Back to paper selection"):
+            st.session_state.landscape_step = 3
             st.rerun()
