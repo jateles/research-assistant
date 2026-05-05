@@ -34,6 +34,7 @@ import anthropic
 import fitz  # PyMuPDF — used only to check availability; extraction is in research_agent
 from fpdf import FPDF
 from research_agent import run_agent, summarise_pdf
+from landscape_agent import anchor_builder
 
 # Initialise the Anthropic client once at module level. Streamlit re-imports
 # this module on each run, but Python's module cache means this line only
@@ -457,20 +458,27 @@ if "messages" not in st.session_state:
 # initialisation needed, but listed here for documentation purposes:
 #   pdf_summary, pdf_source, pdf_figures, pdf_info_card, pdf_bytes, pdf_messages
 
-# ── Mode selector ─────────────────────────────────────────────────────────────
-# Horizontal radio renders as two side-by-side options rather than a stacked list.
-# label_visibility="collapsed" hides the label text while keeping accessibility.
-mode = st.radio(
-    "How would you like to add a paper?",
-    ["Search by PMID", "Upload PDF"],
-    horizontal=True,
-    label_visibility="collapsed",
-)
+# ── Sidebar navigation ────────────────────────────────────────────────────────
+# The sidebar radio persists across all modes and survives reruns. Using the
+# sidebar instead of a horizontal in-page radio keeps the main content area
+# uncluttered, especially important for the landscape mode's multi-step flow.
+with st.sidebar:
+    st.markdown("### Research Assistant")
+    st.markdown("---")
+    # label_visibility="collapsed" hides the widget label while keeping the
+    # radio accessible — the "### Research Assistant" heading acts as the visual label.
+    mode = st.radio(
+        "Mode",
+        ["Single paper", "Upload PDF", "Literature landscape"],
+        label_visibility="collapsed",
+    )
+    st.markdown("---")
+    st.caption("Built with Claude + PubMed")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PMID MODE — fetch from PubMed / PMC (existing functionality, preserved intact)
+# SINGLE PAPER MODE — fetch from PubMed / PMC (existing functionality intact)
 # ══════════════════════════════════════════════════════════════════════════════
-if mode == "Search by PMID":
+if mode == "Single paper":
 
     pmid = st.text_input("PubMed ID")
 
@@ -568,7 +576,7 @@ if mode == "Search by PMID":
 # ══════════════════════════════════════════════════════════════════════════════
 # PDF MODE — upload a paper PDF for full analysis with figure extraction
 # ══════════════════════════════════════════════════════════════════════════════
-else:
+elif mode == "Upload PDF":
     uploaded_file = st.file_uploader(
         "Drop your paper PDF here",
         type="pdf",
@@ -779,3 +787,236 @@ else:
                     "No extractable figures found — "
                     "figures may be vector graphics."
                 )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LITERATURE LANDSCAPE MODE — multi-agent pipeline (Steps 1-2 active)
+# ══════════════════════════════════════════════════════════════════════════════
+elif mode == "Literature landscape":
+
+    # ── Session state initialisation ─────────────────────────────────────────
+    # landscape_step controls which screen is shown:
+    #   1 = user input form
+    #   2 = anchor review and edit
+    #   3 = paper curation (Session 2)
+    #   4 = landscape report (Session 3)
+    # Initialised here rather than at module level so it only exists when the
+    # user is actually in this mode.
+    if "landscape_step" not in st.session_state:
+        st.session_state.landscape_step = 1
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 1: User input
+    # ──────────────────────────────────────────────────────────────────────────
+    if st.session_state.landscape_step == 1:
+
+        st.markdown("## Literature landscape")
+        st.markdown(
+            "Enter a topic, research question, or PMID. "
+            "Claude will build a search anchor for you to review."
+        )
+
+        # Primary input — accepts free text, a PMID, or a research question.
+        # anchor_builder's regex will automatically detect any 7-8 digit PMID.
+        user_input = st.text_area(
+            "What do you want to explore?",
+            height=100,
+            placeholder=(
+                "e.g. 'Stochastic models of haematopoietic commitment' "
+                "or 'PMID 23990771' "
+                "or 'Does transcriptional noise drive cell fate decisions?'"
+            ),
+        )
+
+        # Optional context lets the user bias the anchor toward their specific
+        # use case without changing the core topic string.
+        user_context = st.text_input(
+            "Optional: your role or intent (helps focus the anchor)",
+            placeholder="e.g. 'Evaluating methods for my cancer genomics dataset'",
+        )
+
+        # disabled=not user_input.strip() prevents submitting an empty form —
+        # Streamlit evaluates this expression on every rerun so the button
+        # enables/disables reactively as the user types.
+        if st.button(
+            "Build anchor",
+            type="primary",
+            use_container_width=True,
+            disabled=not user_input.strip(),
+        ):
+            # Concatenate topic and optional context into a single string so
+            # anchor_builder sees full intent in one pass.
+            full_input = user_input.strip()
+            if user_context.strip():
+                full_input += f"\n\nContext: {user_context.strip()}"
+
+            with st.spinner("Agent 0 — building your research anchor..."):
+                anchor = anchor_builder(full_input)
+
+            # Persist anchor and raw input separately — the raw input is shown
+            # in the Step 2 expander so the user can see what they originally typed.
+            st.session_state.landscape_anchor = anchor
+            st.session_state.landscape_input = user_input.strip()
+            st.session_state.landscape_step = 2
+            st.rerun()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 2: Anchor review and edit
+    # ──────────────────────────────────────────────────────────────────────────
+    elif st.session_state.landscape_step == 2:
+
+        anchor = st.session_state.landscape_anchor
+
+        st.markdown("## Review your anchor")
+        st.caption(
+            "Agent 0 proposed this research scope. "
+            "Edit any field before searching."
+        )
+
+        # Show the original input so the user can cross-check Agent 0's
+        # interpretation against what they actually typed.
+        with st.expander("You entered", expanded=False):
+            st.markdown(f"_{st.session_state.landscape_input}_")
+
+        st.markdown("---")
+
+        # ── Editable anchor fields ────────────────────────────────────────────
+        # All fields are pre-populated from the anchor dict returned by Agent 0.
+        # The user can freely edit before confirming; the confirmed values (not
+        # Agent 0's originals) are what downstream agents receive.
+
+        # Central question — the primary filter for relevance ranking.
+        core_question = st.text_area(
+            "Core question",
+            value=anchor.get("core_question", ""),
+            height=80,
+            help="The central question your landscape will answer",
+        )
+
+        # Field scope — defines the search perimeter and time range.
+        field_scope = st.text_area(
+            "Field scope",
+            value=anchor.get("field_scope", ""),
+            height=80,
+            help="Field boundaries and time range for the search",
+        )
+
+        # Key debates displayed as a comma-separated string — simpler than a
+        # dynamic tag widget while preserving all the same data for downstream use.
+        debates_list = anchor.get("key_debates", [])
+        debates_str = st.text_input(
+            "Key debates (comma separated — edit or add your own)",
+            value=", ".join(debates_list),
+        )
+
+        st.markdown("**Search strategy**")
+
+        strategy = anchor.get("search_strategy", {})
+
+        # Three side-by-side checkboxes — pre-set by Agent 0, user can toggle.
+        # Citation traversal is disabled (greyed out) when no PMID was detected
+        # because the scout has no seed paper to traverse from.
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            keyword = st.checkbox(
+                "Keyword search",
+                value=strategy.get("keyword_search", True),
+                help="Search PubMed using terms from the core question",
+            )
+        with col2:
+            citation = st.checkbox(
+                "Citation traversal",
+                value=strategy.get("citation_traversal", False),
+                help=(
+                    "Fetch papers that cite or are cited by a given paper. "
+                    "Requires a PMID in the input."
+                ),
+                # Disable the checkbox entirely if no PMID was found —
+                # the scout can't traverse citations without a seed paper.
+                disabled=not anchor.get("detected_pmid"),
+            )
+        with col3:
+            author_net = st.checkbox(
+                "Author network",
+                value=strategy.get("author_network", True),
+                help="Fetch recent papers by key authors in this area",
+            )
+
+        # Inform the user when a PMID was detected so they understand why
+        # citation traversal is available (or unavailable).
+        if anchor.get("detected_pmid"):
+            st.caption(
+                f"PMID {anchor['detected_pmid']} detected — "
+                "citation traversal is available"
+            )
+
+        st.markdown("---")
+
+        # ── Action buttons ────────────────────────────────────────────────────
+        # Three buttons in a 1:1:2 column layout:
+        #   ← Back         — return to Step 1 and clear the anchor
+        #   Regenerate ↺   — re-run Agent 0 with the same input
+        #   Confirm →      — save edited anchor and advance to Step 3
+        col_back, col_regen, col_confirm = st.columns([1, 1, 2])
+
+        with col_back:
+            if st.button("← Back", use_container_width=True):
+                # Clear the anchor from session state so Step 1 starts fresh.
+                st.session_state.landscape_step = 1
+                if "landscape_anchor" in st.session_state:
+                    del st.session_state.landscape_anchor
+                st.rerun()
+
+        with col_regen:
+            if st.button("Regenerate ↺", use_container_width=True):
+                # Re-run anchor_builder with the same raw input — useful if
+                # Agent 0's first proposal missed the intent.
+                with st.spinner("Regenerating anchor..."):
+                    new_anchor = anchor_builder(
+                        st.session_state.landscape_input
+                    )
+                st.session_state.landscape_anchor = new_anchor
+                st.rerun()
+
+        with col_confirm:
+            if st.button(
+                "Confirm anchor and search →",
+                type="primary",
+                use_container_width=True,
+            ):
+                # Build the confirmed anchor from the current widget values —
+                # this overwrites Agent 0's originals with any edits the user made.
+                edited_anchor = {
+                    "core_question": core_question,
+                    "field_scope": field_scope,
+                    # Split the comma-separated string back into a list,
+                    # stripping whitespace and dropping any empty items.
+                    "key_debates": [
+                        d.strip()
+                        for d in debates_str.split(",")
+                        if d.strip()
+                    ],
+                    "search_strategy": {
+                        "keyword_search": keyword,
+                        "citation_traversal": citation,
+                        "author_network": author_net,
+                    },
+                    # Preserve the detected PMID so the scout can use it even
+                    # if the user didn't change the citation_traversal flag.
+                    "detected_pmid": anchor.get("detected_pmid"),
+                }
+
+                st.session_state.landscape_anchor = edited_anchor
+                st.session_state.landscape_step = 3
+                st.rerun()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEPS 3 and 4: Placeholders — full implementation in Session 2 / 3
+    # ──────────────────────────────────────────────────────────────────────────
+    elif st.session_state.landscape_step in [3, 4]:
+        st.info(
+            "Literature Scout, Relevance Ranker and Synthesis Agent "
+            "coming in the next session."
+        )
+        if st.button("← Back to anchor"):
+            st.session_state.landscape_step = 2
+            st.rerun()
