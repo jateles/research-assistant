@@ -27,6 +27,8 @@ Relationship to other modules:
 import os
 import re
 import json
+import time
+import requests
 from anthropic import Anthropic
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from research_agent import get_pmcid, fetch_abstract
@@ -35,6 +37,13 @@ from research_agent import get_pmcid, fetch_abstract
 # ANTHROPIC_API_KEY from the environment; load_dotenv() in research_agent.py
 # will have already populated os.environ by the time this module is imported.
 client = Anthropic()
+
+# Semantic Scholar API base URL and optional key.
+# Unauthenticated requests are rate-limited to ~100 req/5 min;
+# an API key raises the limit substantially. Set SEMANTIC_SCHOLAR_API_KEY
+# in .env to enable authenticated requests.
+SEMANTIC_SCHOLAR_BASE = "https://api.semanticscholar.org/graph/v1"
+SEMANTIC_SCHOLAR_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
 
 
 def anchor_builder(user_input: str) -> dict:
@@ -176,43 +185,580 @@ def anchor_builder(user_input: str) -> dict:
     return anchor
 
 
-def literature_scout(anchor: dict) -> list:
+def semantic_request(endpoint: str, params: dict) -> dict | None:
     """
-    Agent 1: Fetches candidate papers from PubMed based on the anchor document.
+    Makes a rate-limit-safe GET request to the Semantic Scholar API.
 
-    Uses three retrieval tools in parallel based on the anchor's search_strategy
-    flags:
-      - keyword_search:     PubMed esearch on terms derived from core_question
-      - citation_traversal: fetch papers citing and cited by the seed PMID
-      - author_network:     fetch recent papers by key authors in the field
+    Implements exponential backoff on HTTP 429 (Too Many Requests) responses,
+    as required by the Semantic Scholar API terms of service. All other non-200
+    status codes are treated as non-retryable and return None immediately.
 
-    For each retrieved paper, checks full-text availability via get_pmcid() and
-    fetches the abstract via fetch_abstract() to support relevance ranking.
+    Backoff schedule: 1 s, 2 s, 4 s, 8 s — four attempts total before giving up.
 
     Args:
-        anchor (dict): Anchor document produced by anchor_builder(), containing
-                       core_question, field_scope, search_strategy, and
-                       optionally detected_pmid.
+        endpoint (str): API path, e.g. "/paper/search" or
+                        "/paper/PMID:12345678/citations".
+        params (dict):  Query parameters forwarded to requests.get().
 
     Returns:
-        list[dict]: Candidate papers. Each dict has keys:
-            pmid (str):           PubMed ID
-            title (str):          Paper title
-            authors (str):        Author list
-            journal (str):        Journal name
-            year (str):           Publication year
-            relationship (str):   How this paper was found
-                                  ("keyword", "cited_by", "cites", "author_network")
-            has_full_text (bool): True if a PMCID exists in PMC
-            pmcid (str|None):     PMCID if available, else None
-
-    NOTE: Stub implementation — returns an empty list.
-    Full implementation planned for Session 2.
+        dict: Parsed JSON response body on success, or None if all retries fail
+              or a non-retryable error is encountered.
     """
-    # TODO: Session 2 — implement keyword_search, citation_traversal, author_network
-    # tools and run them in parallel with ThreadPoolExecutor. Use get_pmcid() and
-    # fetch_abstract() from research_agent.py for each retrieved PMID.
-    return []
+    url = SEMANTIC_SCHOLAR_BASE + endpoint
+
+    # Include the API key header when available; falls back to unauthenticated
+    # (lower rate limit) if the environment variable is not set.
+    headers = {}
+    if SEMANTIC_SCHOLAR_KEY:
+        headers["x-api-key"] = SEMANTIC_SCHOLAR_KEY
+
+    for attempt in range(5):
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=10,
+            )
+
+            if response.status_code == 200:
+                return response.json()
+
+            elif response.status_code == 429:
+                # Exponential backoff: 2**0=1s, 2**1=2s, 2**2=4s, 2**3=8s, 2**4=16s.
+                # Five attempts gives the API up to 31 s of cumulative wait time,
+                # which is sufficient for the unauthenticated /paper/search endpoint
+                # to recover when called back-to-back with citation/reference lookups.
+                wait_time = 2 ** attempt
+                print(f"[rate limit] waiting {wait_time}s before retry")
+                time.sleep(wait_time)
+
+            else:
+                # Non-retryable HTTP error — log and give up immediately.
+                print(f"[semantic scholar] error {response.status_code}")
+                return None
+
+        except Exception as e:
+            print(f"[semantic scholar] request failed: {e}")
+            return None
+
+    print("[semantic scholar] all retries exhausted")
+    return None
+
+
+def normalise_paper(
+    pmid: str,
+    title: str,
+    authors: str,
+    journal: str,
+    year: int,
+    relationship: str,
+    intent: str = "",
+) -> dict:
+    """
+    Creates a normalised paper dict used consistently throughout the pipeline.
+
+    All retrieval tool functions return lists of these dicts so Agent 2
+    (relevance_ranker) and Agent 3 (synthesis_agent) can compare and process
+    papers from different sources without handling source-specific formats.
+
+    Full-text availability is checked here by calling get_pmcid() from
+    research_agent.py. This is a network call, so normalise_paper is
+    intentionally called once per paper rather than in a tight loop.
+
+    Args:
+        pmid (str):         PubMed ID of the paper.
+        title (str):        Full paper title.
+        authors (str):      Formatted author string, e.g. "Teles et al."
+        journal (str):      Journal name, or "" if unavailable.
+        year (int):         Publication year, or 0 if unknown.
+        relationship (str): How this paper was found relative to the anchor.
+                            One of: "cites_anchor", "cited_by_anchor",
+                            "same_author", "keyword_match".
+        intent (str):       Semantic Scholar citation intent if available —
+                            "background", "methodology", "result", or "".
+
+    Returns:
+        dict: Normalised paper record with keys:
+              pmid, title, authors, journal, year, relationship,
+              intent, has_full_text (bool), pmcid (str or None).
+    """
+    # get_pmcid returns None if the paper has no free full-text deposit in PMC.
+    pmcid = get_pmcid(pmid)
+
+    return {
+        "pmid": pmid,
+        "title": title,
+        "authors": authors,
+        "journal": journal,
+        "year": year,
+        "relationship": relationship,
+        "intent": intent,
+        "has_full_text": pmcid is not None,
+        "pmcid": pmcid,
+    }
+
+
+def semantic_search(query: str, limit: int = 15) -> list[dict]:
+    """
+    Searches Semantic Scholar by keyword and semantic similarity.
+
+    Unlike a PubMed keyword search, this endpoint uses dense vector similarity
+    to find papers whose meaning matches the query, not just papers whose full
+    text contains the exact query terms. This is particularly useful for
+    cross-disciplinary landscape searches where terminology varies.
+
+    Only papers that have a PubMed ID are included in the results because
+    get_pmcid() and fetch_abstract() — used downstream — require a PMID.
+
+    Args:
+        query (str): Search query — typically the anchor's core_question or
+                     key terms extracted from it.
+        limit (int): Maximum number of results to return. Default 15.
+
+    Returns:
+        list[dict]: Normalised paper dicts with relationship="keyword_match".
+                    Empty list if the API call fails or returns no PMID-linked
+                    papers.
+    """
+    data = semantic_request(
+        "/paper/search",
+        {
+            "query": query,
+            "limit": limit,
+            "fields": "title,authors,year,externalIds,journal,citationCount",
+        },
+    )
+
+    if not data or "data" not in data:
+        return []
+
+    results = []
+    for paper in data["data"]:
+        # Skip papers with no PubMed ID — they can't enter the pipeline.
+        external_ids = paper.get("externalIds") or {}
+        pmid = external_ids.get("PubMed")
+        if not pmid:
+            continue
+
+        # Format as "Surname et al." for multi-author papers, or full name
+        # for single-author papers.
+        authors_list = paper.get("authors") or []
+        if authors_list:
+            first_author = authors_list[0].get("name", "")
+            # Split on space and take the last token as the surname — handles
+            # "FirstName LastName" and "F. LastName" formats.
+            surname = first_author.split(" ")[-1]
+            authors_str = (
+                f"{surname} et al." if len(authors_list) > 1 else first_author
+            )
+        else:
+            authors_str = "Unknown"
+
+        # journal may be a dict {"name": "..."} or None — guard both cases.
+        journal_data = paper.get("journal") or {}
+        journal = journal_data.get("name", "") if isinstance(journal_data, dict) else ""
+
+        results.append(normalise_paper(
+            pmid=pmid,
+            title=paper.get("title", ""),
+            authors=authors_str,
+            journal=journal,
+            year=paper.get("year") or 0,
+            relationship="keyword_match",
+        ))
+
+    return results
+
+
+def semantic_citations(pmid: str, limit: int = 20) -> list[dict]:
+    """
+    Fetches papers that cite the given paper via Semantic Scholar.
+
+    Forward citation traversal — returns papers published after the anchor that
+    build on it. More comprehensive than PubMed elink because Semantic Scholar
+    indexes preprints and conference papers in addition to journal articles.
+
+    The citation intent field (background, methodology, result) is preserved
+    in the normalised dict so Agent 3 can distinguish papers that adopt the
+    anchor's methods from those that merely cite it as background.
+
+    Args:
+        pmid (str): PubMed ID of the anchor paper.
+        limit (int): Maximum number of citing papers to return. Default 20.
+
+    Returns:
+        list[dict]: Normalised paper dicts with relationship="cited_by_anchor".
+                    Papers without a PubMed ID are silently skipped.
+    """
+    data = semantic_request(
+        f"/paper/PMID:{pmid}/citations",
+        {
+            "limit": limit,
+            # Request fields for the citing paper and the citation intent.
+            "fields": (
+                "citingPaper.title,citingPaper.authors,"
+                "citingPaper.year,citingPaper.externalIds,"
+                "citingPaper.journal,intents"
+            ),
+        },
+    )
+
+    if not data or "data" not in data:
+        return []
+
+    results = []
+    for item in data["data"]:
+        paper = item.get("citingPaper") or {}
+        external_ids = paper.get("externalIds") or {}
+        pmid_result = external_ids.get("PubMed")
+        if not pmid_result:
+            continue
+
+        # Take the first listed intent as the primary one — papers occasionally
+        # have multiple intents (e.g. ["background", "methodology"]).
+        intents = item.get("intents") or []
+        intent = intents[0] if intents else ""
+
+        authors_list = paper.get("authors") or []
+        if authors_list:
+            surname = authors_list[0].get("name", "").split(" ")[-1]
+            authors_str = (
+                f"{surname} et al."
+                if len(authors_list) > 1
+                else authors_list[0].get("name", "")
+            )
+        else:
+            authors_str = "Unknown"
+
+        journal_data = paper.get("journal") or {}
+        journal = journal_data.get("name", "") if isinstance(journal_data, dict) else ""
+
+        results.append(normalise_paper(
+            pmid=pmid_result,
+            title=paper.get("title", ""),
+            authors=authors_str,
+            journal=journal,
+            year=paper.get("year") or 0,
+            relationship="cited_by_anchor",
+            intent=intent,
+        ))
+
+    return results
+
+
+def semantic_references(pmid: str, limit: int = 20) -> list[dict]:
+    """
+    Fetches papers referenced by the given paper via Semantic Scholar.
+
+    Backward citation traversal — returns the foundational literature that the
+    anchor paper builds on. These papers populate the "Built upon" section of
+    the landscape report and help the user understand the intellectual lineage
+    of the anchor's methods and claims.
+
+    Args:
+        pmid (str): PubMed ID of the anchor paper.
+        limit (int): Maximum number of references to return. Default 20.
+
+    Returns:
+        list[dict]: Normalised paper dicts with relationship="cites_anchor".
+                    Papers without a PubMed ID are silently skipped.
+    """
+    data = semantic_request(
+        f"/paper/PMID:{pmid}/references",
+        {
+            "limit": limit,
+            "fields": (
+                "citedPaper.title,citedPaper.authors,"
+                "citedPaper.year,citedPaper.externalIds,"
+                "citedPaper.journal,intents"
+            ),
+        },
+    )
+
+    if not data or "data" not in data:
+        return []
+
+    results = []
+    for item in data["data"]:
+        paper = item.get("citedPaper") or {}
+        external_ids = paper.get("externalIds") or {}
+        pmid_result = external_ids.get("PubMed")
+        if not pmid_result:
+            continue
+
+        intents = item.get("intents") or []
+        intent = intents[0] if intents else ""
+
+        authors_list = paper.get("authors") or []
+        if authors_list:
+            surname = authors_list[0].get("name", "").split(" ")[-1]
+            authors_str = (
+                f"{surname} et al."
+                if len(authors_list) > 1
+                else authors_list[0].get("name", "")
+            )
+        else:
+            authors_str = "Unknown"
+
+        journal_data = paper.get("journal") or {}
+        journal = journal_data.get("name", "") if isinstance(journal_data, dict) else ""
+
+        results.append(normalise_paper(
+            pmid=pmid_result,
+            title=paper.get("title", ""),
+            authors=authors_str,
+            journal=journal,
+            year=paper.get("year") or 0,
+            relationship="cites_anchor",
+            intent=intent,
+        ))
+
+    return results
+
+
+def pubmed_author_search(author_name: str, limit: int = 10) -> list[dict]:
+    """
+    Searches PubMed for recent papers by a given author.
+
+    Used to build the author network component of the literature scout —
+    finding other papers in the same research thread as the anchor paper's
+    authors. Results are restricted to the last 10 years to keep the landscape
+    current and avoid surfacing early-career work that predates the author's
+    current research focus.
+
+    Author name format: "Surname Initial" (e.g. "Teles J") is the most
+    reliable format for PubMed author search. Full names also work but
+    may return fewer results due to inconsistent indexing.
+
+    Args:
+        author_name (str): Author name in PubMed format, e.g. "Teles J".
+        limit (int):       Maximum number of papers to return. Default 10.
+
+    Returns:
+        list[dict]: Normalised paper dicts with relationship="same_author".
+                    Title is extracted from the first non-empty line of the
+                    abstract text (a heuristic that works for most PubMed
+                    records). Returns an empty list if the search fails or
+                    the author has no indexed papers in the time window.
+    """
+    search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    search_params = {
+        "db": "pubmed",
+        "term": f"{author_name}[Author]",
+        "datetype": "pdat",
+        "reldate": 3650,   # 10 years in days
+        "retmax": limit,
+        "retmode": "json",
+    }
+
+    try:
+        response = requests.get(search_url, params=search_params, timeout=10)
+        pmids = (
+            response.json()
+            .get("esearchresult", {})
+            .get("idlist", [])
+        )
+    except Exception:
+        return []
+
+    if not pmids:
+        return []
+
+    fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    results = []
+
+    for pmid in pmids:
+        try:
+            fetch_response = requests.get(
+                fetch_url,
+                params={
+                    "db": "pubmed",
+                    "id": pmid,
+                    "rettype": "abstract",
+                    "retmode": "text",
+                },
+                timeout=10,
+            )
+            abstract_text = fetch_response.text.strip()
+
+            # PubMed plain-text abstract format (rettype=abstract, retmode=text)
+            # returns records in roughly this order:
+            #
+            #   Journal. Year Month Day;vol(issue):pages. doi: 10.xxxx/...
+            #
+            #   Title of the paper — this is what we want.
+            #
+            #   Authors AN, Author2 BN.
+            #
+            #   [Abstract body...]
+            #
+            # The first non-empty line is usually the citation header, not the
+            # title. We scan all non-empty lines and skip anything that looks
+            # like a citation, date, or DOI line using four filters:
+            #
+            #   len > 30:               skip short lines (journal abbrevs, initials)
+            #   not line[0].isdigit():  skip numbered references (e.g. "1. J Biol...")
+            #   "doi" not in line:      skip lines containing a DOI
+            #   not \d{4};\d:           skip volume/issue format "2026;8(1):..."
+            #   not \d{4} \w+ \d+:      skip date format "2026 Apr 8"
+            lines = [l.strip() for l in abstract_text.split("\n") if l.strip()]
+            title = f"PMID {pmid}"
+            for line in lines:
+                if (
+                    len(line) > 30
+                    and not line[0].isdigit()
+                    and "doi" not in line.lower()
+                    and not re.search(r'\d{4};\d', line)
+                    and not re.search(r'\d{4} \w+ \d+', line)
+                ):
+                    title = line
+                    break
+
+            results.append(normalise_paper(
+                pmid=pmid,
+                title=title,
+                authors=author_name,
+                journal="",
+                year=0,
+                relationship="same_author",
+            ))
+        except Exception:
+            # Skip individual papers that fail to fetch rather than aborting
+            # the entire author search.
+            continue
+
+    return results
+
+
+def literature_scout(anchor: dict) -> list:
+    """
+    Agent 1: Fetches candidate papers from multiple sources based on the anchor.
+
+    Activates up to three retrieval strategies depending on the anchor's
+    search_strategy flags:
+      - keyword_search:     semantic_search() on the anchor's core_question
+      - citation_traversal: semantic_citations() + semantic_references() on the
+                            seed PMID — forward and backward traversal
+      - author_network:     pubmed_author_search() for the first author of the
+                            anchor paper (extracted from its PubMed abstract)
+
+    Rate-limit strategy:
+        Semantic Scholar tools (semantic_search, semantic_citations,
+        semantic_references) share a single rate limit of ~1 req/sec.
+        Running them concurrently would cause all three to 429 simultaneously,
+        and the retries in semantic_request() would keep colliding on the same
+        backoff cadence. They are therefore run sequentially with a 1 s delay.
+
+        PubMed tools (pubmed_author_search) hit a different API with a more
+        generous rate limit and can safely run in parallel.
+
+    Args:
+        anchor (dict): Anchor document from anchor_builder(), containing
+                       core_question, field_scope, search_strategy (dict of
+                       boolean flags), and optionally detected_pmid.
+
+    Returns:
+        list[dict]: Deduplicated candidate papers (by PMID), each a normalised
+                    paper dict with keys: pmid, title, authors, journal, year,
+                    relationship, intent, has_full_text, pmcid.
+                    Returns [] if no tasks are enabled or all tasks fail.
+    """
+    strategy = anchor.get("search_strategy", {})
+    detected_pmid = anchor.get("detected_pmid")
+    core_question = anchor.get("core_question", "")
+
+    # ── Build task list ───────────────────────────────────────────────────────
+    # Each task is a (func, args_tuple, kwargs_dict) triple so the executor and
+    # sequential loop can call them uniformly with func(*args, **kwargs).
+    tasks = []
+
+    if strategy.get("keyword_search", True) and core_question:
+        tasks.append((semantic_search, (core_question,), {}))
+
+    if strategy.get("citation_traversal", False) and detected_pmid:
+        tasks.append((semantic_citations, (detected_pmid,), {}))
+        tasks.append((semantic_references, (detected_pmid,), {}))
+
+    if strategy.get("author_network", True) and detected_pmid:
+        # Retrieve the first author of the anchor paper from its PubMed abstract
+        # so pubmed_author_search has a concrete name to query.
+        # The abstract text format puts the author list early; we scan the first
+        # five non-empty lines for a "Surname Initials" pattern.
+        try:
+            abstract_text = fetch_abstract(detected_pmid)
+            lines = [l.strip() for l in abstract_text.split("\n") if l.strip()]
+            for line in lines[:5]:
+                author_match = re.match(r'^([A-Z][a-z]+\s+[A-Z]{1,3})\b', line)
+                if author_match:
+                    tasks.append(
+                        (pubmed_author_search, (author_match.group(1),), {})
+                    )
+                    break
+        except Exception:
+            pass  # Author network is best-effort; skip if extraction fails
+
+    if not tasks:
+        return []
+
+    all_results = []
+
+    # Split tasks into semantic scholar and pubmed groups
+    semantic_tasks = []
+    pubmed_tasks = []
+    for task in tasks:
+        func, args, kwargs = task
+        if func.__name__ in [
+            'semantic_search',
+            'semantic_citations',
+            'semantic_references'
+        ]:
+            semantic_tasks.append(task)
+        else:
+            pubmed_tasks.append(task)
+
+    # Run semantic tasks sequentially with 1s delay
+    # Semantic Scholar rate limit is 1 req/sec
+    for i, task in enumerate(semantic_tasks):
+        func, args, kwargs = task
+        try:
+            results = func(*args, **kwargs)
+            all_results.extend(results)
+            print(f"[scout] {func.__name__}: {len(results)} results")
+        except Exception as e:
+            print(f"[scout] {func.__name__} failed: {e}")
+        if i < len(semantic_tasks) - 1:
+            time.sleep(1)
+
+    # Run pubmed tasks in parallel
+    def run_task(task):
+        func, args, kwargs = task
+        return func(*args, **kwargs)
+
+    if pubmed_tasks:
+        with ThreadPoolExecutor(
+            max_workers=len(pubmed_tasks)
+        ) as ex:
+            futures = {
+                ex.submit(run_task, task): task
+                for task in pubmed_tasks
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                all_results.extend(result)
+
+    # ── Deduplicate by PMID ───────────────────────────────────────────────────
+    # Multiple tools can return the same paper (e.g. a highly-cited paper
+    # appears in both keyword search and citation traversal). Keep the first
+    # occurrence to preserve the relationship label from the tool that found it.
+    seen_pmids: set = set()
+    unique_results = []
+    for paper in all_results:
+        if paper["pmid"] not in seen_pmids:
+            seen_pmids.add(paper["pmid"])
+            unique_results.append(paper)
+
+    return unique_results
 
 
 def relevance_ranker(candidates: list, anchor: dict) -> list:
@@ -243,13 +789,83 @@ def relevance_ranker(candidates: list, anchor: dict) -> list:
                         relevance_score (int):      0-100
                         relevance_rationale (str):  one-sentence explanation
 
-    NOTE: Stub implementation — returns candidates unchanged (no scoring).
-    Full implementation planned for Session 2.
     """
-    # TODO: Session 2 — build a single prompt with all candidates and the anchor,
-    # parse Claude's scored JSON response, attach scores to each dict, and sort
-    # descending by relevance_score.
-    return candidates
+    if not candidates:
+        return candidates
+
+    candidate_lines = "\n".join(
+        f'  {{"pmid": "{p["pmid"]}", "title": {json.dumps(p.get("title", ""))}, '
+        f'"authors": {json.dumps(p.get("authors", ""))}, "year": {p.get("year", 0)}, '
+        f'"relationship": "{p.get("relationship", "")}", "intent": "{p.get("intent", "")}"}},'
+        for p in candidates
+    )
+
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=4096,
+        system=(
+            "You are a systematic literature reviewer. "
+            "Score each paper 0-100 for relevance to the research anchor. "
+            "Return only a JSON array. No markdown, no preamble."
+        ),
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Research anchor:\n"
+                f"  core_question: {json.dumps(anchor.get('core_question', ''))}\n"
+                f"  field_scope: {json.dumps(anchor.get('field_scope', ''))}\n"
+                f"  key_debates: {json.dumps(anchor.get('key_debates', []))}\n\n"
+                f"Papers to score:\n[\n{candidate_lines}\n]\n\n"
+                "Return a JSON array where each element has:\n"
+                '  "pmid": "<same pmid>",\n'
+                '  "relevance_score": <integer 0-100>,\n'
+                '  "relevance_rationale": "<one sentence>"\n'
+                "Score 90-100: directly answers core question; canonical reference.\n"
+                "Score 70-89: highly relevant; covers key methods or debates in scope.\n"
+                "Score 50-69: peripherally relevant; useful context but not central.\n"
+                "Score <50: off-topic or outside field_scope time range."
+            ),
+        }],
+    )
+
+    raw = next((b.text for b in response.content if b.type == "text"), "[]")
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1]
+        raw = raw.rsplit("```", 1)[0]
+
+    try:
+        scores = json.loads(raw)
+        if not isinstance(scores, list):
+            scores = []
+    except json.JSONDecodeError:
+        scores = []
+
+    # Build score lookup by pmid
+    score_map = {}
+    for s in scores:
+        if isinstance(s, dict) and "pmid" in s:
+            score_map[str(s["pmid"])] = s
+
+    # Apply scores to candidates
+    # Use .get() with defaults so missing scores never cause KeyError
+    for paper in candidates:
+        score_data = score_map.get(str(paper["pmid"]), {})
+        paper["relevance_score"] = score_data.get(
+            "relevance_score", 50
+        )
+        paper["relevance_rationale"] = score_data.get(
+            "relevance_rationale", "Score unavailable"
+        )
+
+    # Ensure every paper has relevance_score before sorting
+    # This prevents KeyError if any paper was missed
+    for paper in candidates:
+        if "relevance_score" not in paper:
+            paper["relevance_score"] = 50
+            paper["relevance_rationale"] = "Score unavailable"
+
+    return sorted(candidates, key=lambda p: p["relevance_score"], reverse=True)
 
 
 def synthesis_agent(anchor: dict, selected_papers: list) -> str:
