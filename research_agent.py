@@ -26,6 +26,7 @@ import sys
 import base64
 import requests
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 # Load ANTHROPIC_API_KEY (and any other vars) from a local .env file so the
@@ -445,81 +446,25 @@ def run_agent(pubmed_id: str) -> tuple[str, str]:
     return summary, ""
 
 
-def summarise_pdf(pdf_bytes: bytes) -> tuple:
+def fetch_summary(pdf_block: dict, client) -> str:
     """
-    Summarises a PDF paper using Claude's native PDF reading capability.
+    Fetches a structured narrative summary from Claude.
 
-    Makes three sequential API calls:
-      1. Structured narrative summary (title, approach, findings, etc.)
-      2. Machine-readable info card as JSON (hypothesis, stats, limitations, etc.)
-      3. Per-figure interpretation — one call per extracted image (capped at 8)
-
-    Images are extracted via PyMuPDF; small images (≤150 px in either dimension)
-    are filtered out to skip logos, icons, and decorative elements.
+    Designed to run in parallel with fetch_info_card() via ThreadPoolExecutor,
+    cutting the combined latency of both calls roughly in half.
 
     Args:
-        pdf_bytes (bytes): Raw bytes of the uploaded PDF file.
+        pdf_block (dict): Base64-encoded PDF document block for the Claude API.
+        client: Anthropic client instance — passed explicitly rather than using
+                the module-level singleton so this is safe to call from threads.
 
     Returns:
-        tuple: (summary, source_label, figures, info_card)
-            summary (str): Markdown-formatted narrative summary.
-            source_label (str): Provenance string for display in the UI.
-            figures (list[dict]): Each dict has keys:
-                bytes  (bytes) — raw image bytes
-                ext    (str)   — file extension, e.g. 'png'
-                interpretation (str) — Claude's 2-3 sentence description
-            info_card (dict): Structured fields extracted from the paper:
-                title, authors, journal, year, hypothesis, model_system,
-                sample_size, statistical_tests, key_findings, limitations,
-                datasets_tools, relevance_to_drug_discovery
+        str: Markdown-formatted summary with fixed section headers.
     """
-    import fitz  # PyMuPDF — imported here so it's an optional dependency
-
-    # ── Extract images from PDF ───────────────────────────────────────────────
-    # Open from a bytes stream rather than a file path so we never touch disk.
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    extracted_images = []
-    seen_xrefs: set = set()
-
-    for page in doc:
-        for img_ref in page.get_images():
-            xref = img_ref[0]
-            if xref in seen_xrefs:
-                continue
-            seen_xrefs.add(xref)
-            img_data = doc.extract_image(xref)
-            width = img_data["width"]
-            height = img_data["height"]
-            # Skip small images — logos, icons, and decorative elements are
-            # typically under 150 px in either dimension.
-            if width > 150 and height > 150:
-                extracted_images.append({
-                    "bytes": img_data["image"],
-                    "ext": img_data["ext"],
-                    "width": width,
-                    "height": height,
-                })
-
-    # Cap at 8 figures to avoid excessive API calls and token usage.
-    extracted_images = extracted_images[:8]
-
-    # ── Encode PDF as base64 for the Claude API ───────────────────────────────
-    pdf_base64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
-
-    # Reusable document block — passed to both summary and card API calls so
-    # we don't have to re-encode for each call.
-    pdf_block = {
-        "type": "document",
-        "source": {
-            "type": "base64",
-            "media_type": "application/pdf",
-            "data": pdf_base64,
-        },
-    }
-
-    # ── API CALL 1: Narrative summary ─────────────────────────────────────────
-    summary_response = client.messages.create(
-        model="claude-opus-4-5",
+    # claude-sonnet-4-6: strong instruction-following for long-form structured
+    # output; faster and cheaper than Opus while still producing detailed summaries.
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
         max_tokens=1500,
         system=(
             "You are a research assistant helping a computational biologist "
@@ -553,17 +498,34 @@ def summarise_pdf(pdf_bytes: bytes) -> tuple:
             ],
         }],
     )
-
-    summary = next(
-        (b.text for b in summary_response.content if b.type == "text"),
+    return next(
+        (b.text for b in response.content if b.type == "text"),
         "Unable to generate summary.",
     )
 
-    # ── API CALL 2: Structured info card as JSON ──────────────────────────────
-    # The system prompt explicitly forbids markdown wrapping so we can parse
-    # the response directly with json.loads() without stripping fences.
-    card_response = client.messages.create(
-        model="claude-opus-4-5",
+
+def fetch_info_card(pdf_block: dict, client) -> dict:
+    """
+    Extracts a structured JSON info card from the paper via Claude.
+
+    Designed to run in parallel with fetch_summary() via ThreadPoolExecutor.
+    The system prompt explicitly forbids markdown wrapping so the response can
+    be parsed directly with json.loads() without stripping fences.
+
+    Args:
+        pdf_block (dict): Base64-encoded PDF document block for the Claude API.
+        client: Anthropic client instance — passed explicitly for thread safety.
+
+    Returns:
+        dict: Structured paper metadata with keys: title, authors, journal,
+              year, hypothesis, model_system, sample_size, statistical_tests,
+              key_findings, limitations, datasets_tools,
+              relevance_to_drug_discovery. Returns {} if JSON parsing fails.
+    """
+    # claude-sonnet-4-6: reliable constrained output for structured extraction
+    # tasks; Opus would be overkill for a fixed JSON schema response.
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
         max_tokens=1000,
         system=(
             "You are a precise data extractor. "
@@ -598,64 +560,203 @@ def summarise_pdf(pdf_bytes: bytes) -> tuple:
     )
 
     card_text = next(
-        (b.text for b in card_response.content if b.type == "text"),
+        (b.text for b in response.content if b.type == "text"),
         "{}",
     )
 
-    # Strip accidental markdown fences if Claude added them despite instructions.
+    # Strip accidental markdown fences if Claude added them despite the system prompt.
     card_text = card_text.strip()
     if card_text.startswith("```"):
         card_text = card_text.split("\n", 1)[1]
         card_text = card_text.rsplit("```", 1)[0]
 
     try:
-        info_card = json.loads(card_text)
+        return json.loads(card_text)
     except json.JSONDecodeError:
-        info_card = {}
+        return {}
 
-    # ── API CALL 3: Per-figure interpretations ────────────────────────────────
-    # One call per extracted image. Errors are caught individually so a bad
-    # image doesn't abort interpretation of the remaining figures.
-    for img in extracted_images:
-        img_base64 = base64.standard_b64encode(img["bytes"]).decode("utf-8")
 
-        # Normalise 'jpg' to 'jpeg' to satisfy the API media type spec.
-        ext = img["ext"]
-        media_type = "image/jpeg" if ext == "jpg" else f"image/{ext}"
+def interpret_figure(img: dict) -> dict:
+    """
+    Interprets a single figure using Claude vision.
 
-        try:
-            fig_response = client.messages.create(
-                model="claude-opus-4-5",
-                max_tokens=200,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": img_base64,
-                            },
+    Designed to be called in parallel via ThreadPoolExecutor — each invocation
+    is independent and uses the module-level client singleton directly (the
+    Anthropic client is thread-safe for concurrent read-only API calls).
+
+    Args:
+        img (dict): Figure dict with 'bytes' (raw image bytes) and 'ext' keys.
+
+    Returns:
+        dict: Same img dict with 'interpretation' key added.
+    """
+    img_base64 = base64.standard_b64encode(img["bytes"]).decode("utf-8")
+    ext = img["ext"]
+    # Normalise 'jpg' to 'jpeg' to satisfy the API media type spec.
+    media_type = "image/jpeg" if ext == "jpg" else f"image/{ext}"
+
+    try:
+        # claude-haiku-4-5-20251001: fastest and most cost-efficient model for
+        # short vision tasks; ideal here because many calls run in parallel and
+        # each response is capped at 200 tokens — latency matters more than depth.
+        fig_response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": img_base64,
                         },
-                        {
-                            "type": "text",
-                            "text": (
-                                "This is a figure from a scientific paper. "
-                                "In 2-3 sentences: what does it show, what is the "
-                                "key pattern or finding, and what biological or "
-                                "statistical insight does it provide?"
-                            ),
-                        },
-                    ],
-                }],
-            )
-            img["interpretation"] = next(
-                (b.text for b in fig_response.content if b.type == "text"),
-                "Unable to interpret figure.",
-            )
-        except Exception:
-            img["interpretation"] = "Figure interpretation unavailable."
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "This is a figure from a scientific paper. "
+                            "In 2-3 sentences: what does it show, what is the "
+                            "key pattern or finding, and what biological or "
+                            "statistical insight does it provide?"
+                        ),
+                    },
+                ],
+            }],
+        )
+        img["interpretation"] = next(
+            (b.text for b in fig_response.content if b.type == "text"),
+            "Unable to interpret figure.",
+        )
+    except Exception:
+        img["interpretation"] = "Figure interpretation unavailable."
+
+    return img
+
+
+def summarise_pdf(pdf_bytes: bytes) -> tuple:
+    """
+    Summarises a PDF paper using Claude's native PDF reading capability.
+
+    Runs API calls in parallel for efficiency:
+      - fetch_summary and fetch_info_card execute simultaneously (2 workers)
+      - All figure interpretations execute simultaneously (4 workers)
+
+    Images are extracted via PyMuPDF with two filters applied:
+      1. Pages whose first 500 characters contain supplementary keywords are
+         skipped entirely, keeping only main-paper figures.
+      2. Images smaller than 150×150 px are discarded (logos, icons, decorations).
+
+    Args:
+        pdf_bytes (bytes): Raw bytes of the uploaded PDF file.
+
+    Returns:
+        tuple: (summary, source_label, figures, info_card)
+            summary (str): Markdown-formatted narrative summary.
+            source_label (str): Provenance string for display in the UI.
+            figures (list[dict]): Sorted largest-first; each dict has keys:
+                bytes  (bytes) — raw image bytes
+                ext    (str)   — file extension, e.g. 'png'
+                width, height  (int) — pixel dimensions
+                interpretation (str) — Claude's 2-3 sentence description
+            info_card (dict): Structured fields extracted from the paper.
+    """
+    import fitz  # PyMuPDF — imported here so it's an optional dependency
+
+    # ── Extract images, skipping supplementary pages ──────────────────────────
+    # Supplementary keyword detection works by checking the first 500 characters
+    # of each page's plain text. This covers the page title and first paragraph,
+    # where supplementary headers almost always appear in journal PDFs.
+    # Limitation: appendices without explicit header text (e.g. numbered tables
+    # in a continuous document) will not be filtered out by this heuristic.
+    SUPPLEMENTARY_KEYWORDS = [
+        "supplementary",
+        "supplemental",
+        "supporting information",
+        "appendix",
+        "extended data",
+    ]
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    extracted_images = []
+    seen_xrefs: set = set()
+
+    for page in doc:
+        # Lowercase for case-insensitive matching — journal PDFs vary in
+        # capitalisation of section headers ("Supplementary" vs "SUPPLEMENTARY").
+        page_text = page.get_text().lower()
+
+        is_supplementary = any(
+            keyword in page_text[:500]
+            for keyword in SUPPLEMENTARY_KEYWORDS
+        )
+        if is_supplementary:
+            continue
+
+        for img_ref in page.get_images():
+            xref = img_ref[0]
+            if xref in seen_xrefs:
+                continue
+            seen_xrefs.add(xref)
+            img_data = doc.extract_image(xref)
+            width = img_data["width"]
+            height = img_data["height"]
+            # Skip small images — logos, icons, and decorative elements are
+            # typically under 150 px in either dimension.
+            if width > 150 and height > 150:
+                extracted_images.append({
+                    "bytes": img_data["image"],
+                    "ext": img_data["ext"],
+                    "width": width,
+                    "height": height,
+                })
+
+    # No figure cap — supplementary filtering above controls volume. All main
+    # paper figures are forwarded to the parallel interpretation step.
+
+    # ── Encode PDF as base64 for the Claude API ───────────────────────────────
+    pdf_base64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+
+    # Reusable document block passed to both summary and info card calls.
+    pdf_block = {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": pdf_base64,
+        },
+    }
+
+    # ── Run summary and info card in parallel ─────────────────────────────────
+    # Both calls are fully independent — running them concurrently cuts the
+    # combined latency roughly in half compared to sequential execution.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        summary_future = executor.submit(fetch_summary, pdf_block, client)
+        card_future = executor.submit(fetch_info_card, pdf_block, client)
+        summary = summary_future.result()
+        info_card = card_future.result()
+
+    # ── Run figure interpretations in parallel ────────────────────────────────
+    # Each figure is an independent API call. With 4 workers, total interpretation
+    # time scales with ceil(n_figures / 4) instead of n_figures.
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(interpret_figure, img): img
+            for img in extracted_images
+        }
+        results = []
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    # as_completed() yields in completion order, not submission order.
+    # Sort by image area (largest first) as a proxy for figure importance —
+    # main paper figures tend to be larger than insets or thumbnails.
+    extracted_images = sorted(
+        results,
+        key=lambda x: x["width"] * x["height"],
+        reverse=True,
+    )
 
     return (
         summary,

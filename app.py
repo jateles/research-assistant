@@ -343,6 +343,32 @@ def _build_pdf(pmid: str, summary: str) -> bytes:
     return bytes(pdf.output())
 
 
+# @st.dialog creates a modal overlay that appears when the decorated function
+# is called. width="large" uses the wider modal variant. The function body runs
+# like a normal Streamlit script inside the modal — st.image, st.markdown, etc.
+# all work as usual. The modal closes when the user clicks outside it or presses
+# Escape. The decorator must be applied at definition time, before any UI code
+# calls the function.
+@st.dialog("Figure detail", width="large")
+def show_figure_popup(fig: dict, fig_number: int) -> None:
+    """
+    Displays a figure in a large popup modal with Claude's interpretation.
+
+    Args:
+        fig (dict): Figure dict with 'bytes' (raw image bytes) and
+                    'interpretation' (Claude's description string) keys.
+        fig_number (int): 1-based figure number shown as the image caption.
+    """
+    st.image(
+        fig["bytes"],
+        caption=f"Figure {fig_number}",
+        use_container_width=True,
+    )
+    st.divider()
+    st.markdown("**Claude's interpretation**")
+    st.markdown(fig["interpretation"])
+
+
 # ── UI ───────────────────────────────────────────────────────────────────────
 
 # Inject custom CSS covering both PMID and PDF mode components.
@@ -720,8 +746,10 @@ else:
                     )
 
             # ── FIGURE GALLERY ────────────────────────────────────────────────
-            # Two-column grid; pairs of figures fill each row. Figures are stored
-            # as raw bytes in session state so we pass them directly to st.image().
+            # Two-column grid sorted by image area (largest first, done in
+            # research_agent.py). Figures are stored as raw bytes in session
+            # state and passed directly to st.image(). Clicking "View & interpret"
+            # opens the figure in a large @st.dialog modal overlay.
             figures = st.session_state.get("pdf_figures", [])
             if figures:
                 st.markdown(f"### Figures ({len(figures)} extracted)")
@@ -738,8 +766,14 @@ else:
                                     caption=f"Figure {idx + 1}",
                                     use_container_width=True,
                                 )
-                                with st.expander("Claude's interpretation"):
-                                    st.markdown(fig["interpretation"])
+                                # Unique key required — Streamlit errors if two
+                                # buttons in the same script share the same key.
+                                if st.button(
+                                    "🔍 View & interpret",
+                                    key=f"fig_btn_{idx}",
+                                    use_container_width=True,
+                                ):
+                                    show_figure_popup(fig, idx + 1)
             else:
                 st.caption(
                     "No extractable figures found — "
