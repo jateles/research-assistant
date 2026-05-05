@@ -25,12 +25,15 @@ Main flow of execution:
 
 import re
 import unicodedata
+import base64
+import json
 from datetime import date
 import os
 import streamlit as st
 import anthropic
+import fitz  # PyMuPDF — used only to check availability; extraction is in research_agent
 from fpdf import FPDF
-from research_agent import run_agent
+from research_agent import run_agent, summarise_pdf
 
 # Initialise the Anthropic client once at module level. Streamlit re-imports
 # this module on each run, but Python's module cache means this line only
@@ -342,11 +345,11 @@ def _build_pdf(pmid: str, summary: str) -> bytes:
 
 # ── UI ───────────────────────────────────────────────────────────────────────
 
-# Inject custom CSS for the header card, dividers, and summary card.
+# Inject custom CSS covering both PMID and PDF mode components.
 # unsafe_allow_html=True is required to render raw HTML/CSS in Streamlit.
-# The styles match the PDF colour palette for a consistent look across formats.
 st.markdown("""
 <style>
+/* ── Shared layout components ────────────────────────────────────────────── */
 .header-card {
     background: #1E293B;
     border-left: 4px solid #2DD4BF;
@@ -354,29 +357,63 @@ st.markdown("""
     border-radius: 8px;
     margin-bottom: 1.5rem;
 }
-.header-card h1 {
-    color: #F1F5F9;
-    margin: 0 0 0.25rem 0;
-    font-size: 1.8rem;
-}
-.header-card p {
-    color: #94A3B8;
-    margin: 0;
-    font-size: 0.95rem;
-}
-.teal-divider {
-    border: none;
-    border-top: 1px solid #2DD4BF;
-    margin: 1.5rem 0;
-    opacity: 0.5;
-}
-.summary-card {
+.header-card h1 { color: #F1F5F9; margin: 0 0 0.25rem 0; font-size: 1.8rem; }
+.header-card p  { color: #94A3B8; margin: 0; font-size: 0.95rem; }
+.teal-divider   { border: none; border-top: 1px solid #2DD4BF; margin: 1.5rem 0; opacity: 0.5; }
+.summary-card   { background: #1E293B; border: 1px solid #334155; border-radius: 8px;
+                  padding: 1.5rem; color: #F1F5F9; line-height: 1.7; }
+
+/* ── Mode selector cards ─────────────────────────────────────────────────── */
+.mode-card {
     background: #1E293B;
-    border: 1px solid #334155;
-    border-radius: 8px;
-    padding: 1.5rem;
-    color: #F1F5F9;
-    line-height: 1.7;
+    border: 1.5px solid #334155;
+    border-radius: 10px;
+    padding: 16px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+.mode-card.active { border-color: #2DD4BF; }
+
+/* ── Info card fields ────────────────────────────────────────────────────── */
+.info-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: #2DD4BF;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 4px;
+}
+.info-value { font-size: 13px; color: #CBD5E1; margin-bottom: 12px; }
+.tag-pill {
+    display: inline-block;
+    background: #0F172A;
+    border: 0.5px solid #334155;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 11px;
+    color: #94A3B8;
+    margin: 2px 2px 0 0;
+}
+.finding-block {
+    background: #0F172A;
+    border-left: 2px solid #2DD4BF;
+    padding: 8px 12px;
+    border-radius: 0 6px 6px 0;
+    font-size: 12px;
+    color: #CBD5E1;
+    margin-bottom: 6px;
+    line-height: 1.5;
+}
+.limitation-block {
+    background: #0F172A;
+    border-left: 2px solid #F59E0B;
+    padding: 8px 12px;
+    border-radius: 0 6px 6px 0;
+    font-size: 12px;
+    color: #CBD5E1;
+    margin-bottom: 6px;
+    line-height: 1.5;
 }
 </style>
 
@@ -387,175 +424,324 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Session state initialisation ─────────────────────────────────────────────
-#
-# st.session_state.messages stores the conversation history as a list of
-# {"role": ..., "content": ...} dicts in the format expected by the Claude API.
-# It needs to persist across reruns because Streamlit re-executes the entire
-# script on every user interaction; without session state, the history would
-# be lost and Claude would lose context between follow-up questions.
-# The first two entries (index 0 and 1) are always the original fetch request
-# and the initial summary; subsequent entries are follow-up Q&A turns.
+# PMID mode: conversation history (index 0-1 are seed; 2+ are follow-ups)
 if "messages" not in st.session_state:
     st.session_state.messages = []
+# PDF mode keys are accessed via .get() with defaults throughout — no explicit
+# initialisation needed, but listed here for documentation purposes:
+#   pdf_summary, pdf_source, pdf_figures, pdf_info_card, pdf_bytes, pdf_messages
 
-# st.text_input renders a single-line text field and returns the current value
-# as a string. The empty string "" is returned until the user types something.
-pmid = st.text_input("PubMed ID")
+# ── Mode selector ─────────────────────────────────────────────────────────────
+# Horizontal radio renders as two side-by-side options rather than a stacked list.
+# label_visibility="collapsed" hides the label text while keeping accessibility.
+mode = st.radio(
+    "How would you like to add a paper?",
+    ["Search by PMID", "Upload PDF"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
 
-# st.button renders a clickable button and returns True only on the specific
-# rerun triggered by that button click; it returns False on all other reruns.
-if st.button("Fetch & Summarise"):
-    if not pmid.strip():
-        # st.warning renders a yellow warning box visible to the user.
-        st.warning("Please enter a PubMed ID.")
-    else:
-        # st.spinner shows an animated loading indicator for the duration of
-        # the with block, giving the user feedback while run_agent() runs.
-        with st.spinner("Fetching and summarising..."):
-            summary, fetched_text = run_agent(pmid.strip())
+# ══════════════════════════════════════════════════════════════════════════════
+# PMID MODE — fetch from PubMed / PMC (existing functionality, preserved intact)
+# ══════════════════════════════════════════════════════════════════════════════
+if mode == "Search by PMID":
 
-            # Store the summary in session state so it survives the next rerun
-            # (Streamlit reruns after every button click). Without this, the
-            # summary would disappear as soon as the user interacts with the page.
-            st.session_state["summary"] = summary
+    pmid = st.text_input("PubMed ID")
 
-            # Store the PMID so the download file names remain correct even if
-            # the user edits the text input after the fetch has completed.
-            st.session_state["pmid"] = pmid.strip()
+    if st.button("Fetch & Summarise"):
+        if not pmid.strip():
+            st.warning("Please enter a PubMed ID.")
+        else:
+            with st.spinner("Fetching and summarising..."):
+                summary, fetched_text = run_agent(pmid.strip())
+                # Persist results so they survive Streamlit reruns triggered by
+                # subsequent interactions (e.g. the user typing a follow-up).
+                st.session_state["summary"] = summary
+                st.session_state["pmid"] = pmid.strip()
+                st.session_state["fetched_text"] = fetched_text
+                # Seed the conversation with the original request and summary.
+                # index 0 = user request, index 1 = initial summary.
+                # Follow-up Q&A is appended from index 2 onward.
+                st.session_state.messages = [
+                    {"role": "user", "content": f"Fetch and summarise PMID {pmid.strip()}"},
+                    {"role": "assistant", "content": summary},
+                ]
 
-            # Store the raw fetched text so we can show the provenance caption
-            # below the summary card without re-fetching.
-            st.session_state["fetched_text"] = fetched_text
+    if "summary" in st.session_state:
+        summary = st.session_state["summary"]
+        saved_pmid = st.session_state["pmid"]
 
-            # Seed the messages list with the original request and summary as
-            # the first two turns. Follow-up questions will be appended here.
-            # These first two entries are skipped when rendering the chat history
-            # below (we use messages[2:]) because the summary is already shown
-            # in the styled summary card above the chat area.
-            st.session_state.messages = [
-                {"role": "user", "content": f"Fetch and summarise PMID {pmid.strip()}"},
+        st.markdown('<hr class="teal-divider">', unsafe_allow_html=True)
+
+        # Render the summary inside a styled dark card; the markdown is already
+        # produced by Claude so we embed it directly as HTML.
+        st.markdown(f'<div class="summary-card">{summary}</div>', unsafe_allow_html=True)
+
+        # Provenance caption — driven by the [Source: …] tag appended by
+        # fetch_full_text() in research_agent.py.
+        fetched_text = st.session_state.get("fetched_text", "")
+        if "[Source: Full text" in fetched_text:
+            st.caption("📄 Full text retrieved via PubMed Central")
+        elif "[Source: Abstract only" in fetched_text:
+            st.caption("📋 Abstract only — full text not available in PMC")
+
+        st.markdown('<hr class="teal-divider">', unsafe_allow_html=True)
+
+        # Download buttons rendered side by side in a two-column layout.
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                label="Download as Markdown",
+                data=summary,
+                file_name=f"{saved_pmid}.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+        with col2:
+            # _build_pdf() is pure Python (no network) so calling it on every
+            # rerun is cheap enough that we skip caching.
+            st.download_button(
+                label="Download as PDF",
+                data=_build_pdf(saved_pmid, summary),
+                file_name=f"{saved_pmid}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+
+        st.markdown('<hr class="teal-divider">', unsafe_allow_html=True)
+
+        # ── Follow-up chat ────────────────────────────────────────────────────
+        # Render only follow-up turns (index 2+); the initial summary is already
+        # shown in the styled card above.
+        for msg in st.session_state.messages[2:]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        if question := st.chat_input("Ask a follow-up question about this paper..."):
+            st.session_state.messages.append({"role": "user", "content": question})
+            with st.chat_message("user"):
+                st.markdown(question)
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    # Simple stateless completion — no tool use. The full messages
+                    # list gives Claude complete context of the conversation so far.
+                    api_response = _client.messages.create(
+                        model="claude-sonnet-4-6",
+                        max_tokens=1024,
+                        system=_SYSTEM_PROMPT,
+                        messages=st.session_state.messages,
+                    )
+                    # next() with default avoids StopIteration if no text block
+                    answer = next(
+                        (b.text for b in api_response.content if b.type == "text"),
+                        "Unable to generate response.",
+                    )
+                st.markdown(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PDF MODE — upload a paper PDF for full analysis with figure extraction
+# ══════════════════════════════════════════════════════════════════════════════
+else:
+    uploaded_file = st.file_uploader(
+        "Drop your paper PDF here",
+        type="pdf",
+        help="Upload any paper PDF for full text analysis including figures",
+    )
+
+    if uploaded_file:
+        if st.button("Analyse paper", type="primary", use_container_width=True):
+            pdf_bytes = uploaded_file.read()
+
+            with st.spinner("Reading paper, extracting figures..."):
+                summary, source_label, figures, info_card = summarise_pdf(pdf_bytes)
+
+            # All PDF mode results are stored under separate session_state keys
+            # so they never conflict with the PMID mode keys.
+            st.session_state.pdf_summary = summary
+            st.session_state.pdf_source = source_label
+            st.session_state.pdf_figures = figures
+            st.session_state.pdf_info_card = info_card
+            st.session_state.pdf_bytes = pdf_bytes
+            # Seed with the analysis request and initial summary.
+            # index 0-1 are skipped when rendering the follow-up chat history.
+            st.session_state.pdf_messages = [
+                {"role": "user", "content": "Analyse this uploaded paper"},
                 {"role": "assistant", "content": summary},
             ]
 
-# ── Render summary and download buttons if a summary has been fetched ─────────
-#
-# st.session_state["summary"] is set by the button handler above. Checking for
-# it here (rather than inside the button block) means the summary persists
-# across reruns even when the user is typing a follow-up question rather than
-# clicking the button again.
-if "summary" in st.session_state:
-    # Retrieve persisted values from session state.
-    summary = st.session_state["summary"]
-    saved_pmid = st.session_state["pmid"]
+    # ── Results layout ────────────────────────────────────────────────────────
+    # Shown persistently once a PDF has been analysed, regardless of whether
+    # a new file is currently uploaded in the file uploader widget.
+    if st.session_state.get("pdf_summary"):
+        left_col, right_col = st.columns([3, 2])
 
-    # Render a thin teal horizontal rule as a visual separator.
-    st.markdown('<hr class="teal-divider">', unsafe_allow_html=True)
+        # ── LEFT COLUMN: narrative summary + follow-up chat ───────────────────
+        with left_col:
+            st.caption("📄 Full text via uploaded PDF")
+            st.markdown("### Summary")
+            st.markdown(st.session_state.pdf_summary)
+            st.divider()
+            st.markdown("### Ask a follow-up")
 
-    # Render the summary inside a styled dark card.
-    # The summary is already markdown-formatted by Claude, so we embed it
-    # directly as HTML inside the card div; unsafe_allow_html is needed.
-    st.markdown(
-        f'<div class="summary-card">{summary}</div>',
-        unsafe_allow_html=True,
-    )
+            # Render follow-up turns only — the seed entries at index 0-1 are
+            # displayed above via st.markdown, not as chat bubbles.
+            for msg in st.session_state.pdf_messages[2:]:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
 
-    # Show a provenance caption indicating whether full text or abstract was
-    # used. The tag appended by fetch_full_text() in research_agent.py is the
-    # signal — no tag means something went wrong or the field is empty.
-    fetched_text = st.session_state.get("fetched_text", "")
-    if "[Source: Full text" in fetched_text:
-        st.caption("📄 Full text retrieved via PubMed Central")
-    elif "[Source: Abstract only" in fetched_text:
-        st.caption("📋 Abstract only — full text not available in PMC")
+            if prompt := st.chat_input("Ask about this paper..."):
+                st.session_state.pdf_messages.append({"role": "user", "content": prompt})
 
-    st.markdown('<hr class="teal-divider">', unsafe_allow_html=True)
+                # Re-encode the PDF for this API call so the model always has the
+                # full paper in context, regardless of how many turns have passed.
+                pdf_b64 = base64.standard_b64encode(
+                    st.session_state.pdf_bytes
+                ).decode("utf-8")
 
-    # st.columns(2) returns two equal-width column objects. Placing each
-    # download button in its own column renders them side by side rather than
-    # stacked vertically.
-    col1, col2 = st.columns(2)
+                # Build the messages list: all previous turns as plain text, then
+                # the current prompt with the PDF attached as a document block.
+                api_messages = []
+                for msg in st.session_state.pdf_messages[:-1]:
+                    api_messages.append(msg)
+                api_messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": pdf_b64,
+                            },
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                })
 
-    with col1:
-        # st.download_button renders a button that triggers a file download in
-        # the user's browser when clicked. Returns True on the click rerun.
-        # data accepts str or bytes; mime tells the browser what type to expect.
-        st.download_button(
-            label="Download as Markdown",
-            data=summary,           # summary is already a str; no conversion needed
-            file_name=f"{saved_pmid}.md",
-            mime="text/markdown",
-            use_container_width=True,  # stretch to fill the column width
-        )
-
-    with col2:
-        # _build_pdf() is called on every rerun where a summary exists. The
-        # call is cheap enough (pure Python, no network) that we don't cache it.
-        st.download_button(
-            label="Download as PDF",
-            data=_build_pdf(saved_pmid, summary),  # returns bytes
-            file_name=f"{saved_pmid}.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-        )
-
-    st.markdown('<hr class="teal-divider">', unsafe_allow_html=True)
-
-    # ── Follow-up chat loop ──────────────────────────────────────────────────
-    # Render only the follow-up turns (index 2 onwards); the initial fetch
-    # request and summary are shown in the styled card above, not here.
-    for msg in st.session_state.messages[2:]:
-        # st.chat_message renders a chat bubble with a role avatar (user/assistant).
-        with st.chat_message(msg["role"]):
-            # st.markdown renders the message content as formatted markdown.
-            st.markdown(msg["content"])
-
-    # st.chat_input renders a fixed chat input bar at the bottom of the page.
-    # It returns the submitted string when the user presses Enter or the send
-    # button, and None on all other reruns. The walrus operator (:=) assigns
-    # the value and enters the if block only when a non-None string is returned.
-    if question := st.chat_input("Ask a follow-up question about this paper..."):
-        # Append the new user question to the messages list before calling the
-        # API so the API receives the complete conversation history including
-        # this new turn. Without this append, the history would be one turn
-        # behind and Claude would not see the question it is answering.
-        st.session_state.messages.append({"role": "user", "content": question})
-
-        # Display the user's question immediately in a chat bubble so the UI
-        # feels responsive while we wait for the API response.
-        with st.chat_message("user"):
-            st.markdown(question)
-
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                # ── Follow-up API call ────────────────────────────────────────
-                #
-                # This is a simple stateless completion call — no tool use.
-                # The messages list at this point contains:
-                #   [0] user: original fetch request
-                #   [1] assistant: initial summary
-                #   [2..n] alternating user/assistant follow-up turns
-                #   [last] user: the question just entered above
-                #
-                # We pass the full messages list so Claude has complete context
-                # of everything discussed so far about this paper.
-                #
-                # The system prompt steers Claude to stay focused on the paper
-                # and be honest about the limits of the summary in context.
-                #
-                # Expected stop_reason: "end_turn" — no tools are defined for
-                # this call, so Claude always answers directly.
-                api_response = _client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=1024,
-                    system=_SYSTEM_PROMPT,
-                    messages=st.session_state.messages,
+                chat_response = _client.messages.create(
+                    model="claude-opus-4-5",
+                    max_tokens=1000,
+                    system="You are a research assistant. Answer questions about this paper precisely.",
+                    messages=api_messages,
                 )
-                # Extract the text from the first (and only) content block.
-                answer = api_response.content[0].text
-            st.markdown(answer)
 
-        # Append the assistant's reply to session state so it is included in
-        # the history on the next rerun. This is what makes the chat persistent:
-        # each turn is saved immediately so subsequent API calls see the full
-        # history and can maintain coherent multi-turn conversations.
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+                answer = next(
+                    (b.text for b in chat_response.content if b.type == "text"),
+                    "Unable to generate response.",
+                )
+
+                st.session_state.pdf_messages.append({"role": "assistant", "content": answer})
+                st.rerun()
+
+        # ── RIGHT COLUMN: structured info card + figure gallery ───────────────
+        with right_col:
+
+            # ── INFO CARD ─────────────────────────────────────────────────────
+            if st.session_state.get("pdf_info_card"):
+                card = st.session_state.pdf_info_card
+                st.markdown("### Paper at a glance")
+
+                if card.get("hypothesis"):
+                    st.markdown(
+                        f'<div class="info-label">Hypothesis</div>'
+                        f'<div class="info-value">{card["hypothesis"]}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Model system and sample size rendered side by side
+                m1, m2 = st.columns(2)
+                with m1:
+                    if card.get("model_system"):
+                        st.markdown(
+                            f'<div class="info-label">Model system</div>'
+                            f'<div class="info-value">{card["model_system"]}</div>',
+                            unsafe_allow_html=True,
+                        )
+                with m2:
+                    if card.get("sample_size"):
+                        st.markdown(
+                            f'<div class="info-label">Sample size</div>'
+                            f'<div class="info-value">{card["sample_size"]}</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                # Statistical methods as small pill badges
+                if card.get("statistical_tests"):
+                    pills_html = "".join(
+                        f'<span class="tag-pill">{t}</span>'
+                        for t in card["statistical_tests"]
+                    )
+                    st.markdown(
+                        f'<div class="info-label">Statistical methods</div>'
+                        f'<div style="margin-bottom:12px">{pills_html}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Datasets and tools as pill badges
+                if card.get("datasets_tools"):
+                    pills_html = "".join(
+                        f'<span class="tag-pill">{d}</span>'
+                        for d in card["datasets_tools"]
+                    )
+                    st.markdown(
+                        f'<div class="info-label">Datasets & tools</div>'
+                        f'<div style="margin-bottom:12px">{pills_html}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Key findings with a teal left-border accent
+                if card.get("key_findings"):
+                    findings_html = "".join(
+                        f'<div class="finding-block">{f}</div>'
+                        for f in card["key_findings"]
+                    )
+                    st.markdown(
+                        f'<div class="info-label">Key findings</div>{findings_html}',
+                        unsafe_allow_html=True,
+                    )
+
+                # Limitations with an amber left-border accent
+                if card.get("limitations"):
+                    lims_html = "".join(
+                        f'<div class="limitation-block">{l}</div>'
+                        for l in card["limitations"]
+                    )
+                    st.markdown(
+                        f'<div class="info-label">Limitations</div>{lims_html}',
+                        unsafe_allow_html=True,
+                    )
+
+                if card.get("relevance_to_drug_discovery"):
+                    st.markdown(
+                        f'<div class="info-label">Drug discovery relevance</div>'
+                        f'<div class="info-value">{card["relevance_to_drug_discovery"]}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            # ── FIGURE GALLERY ────────────────────────────────────────────────
+            # Two-column grid; pairs of figures fill each row. Figures are stored
+            # as raw bytes in session state so we pass them directly to st.image().
+            figures = st.session_state.get("pdf_figures", [])
+            if figures:
+                st.markdown(f"### Figures ({len(figures)} extracted)")
+
+                for i in range(0, len(figures), 2):
+                    cols = st.columns(2)
+                    for j, col in enumerate(cols):
+                        idx = i + j
+                        if idx < len(figures):
+                            fig = figures[idx]
+                            with col:
+                                st.image(
+                                    fig["bytes"],
+                                    caption=f"Figure {idx + 1}",
+                                    use_container_width=True,
+                                )
+                                with st.expander("Claude's interpretation"):
+                                    st.markdown(fig["interpretation"])
+            else:
+                st.caption(
+                    "No extractable figures found — "
+                    "figures may be vector graphics."
+                )

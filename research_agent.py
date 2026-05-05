@@ -23,6 +23,7 @@ import anthropic
 import os
 import json
 import sys
+import base64
 import requests
 import xml.etree.ElementTree as ET
 from dotenv import load_dotenv
@@ -442,6 +443,226 @@ def run_agent(pubmed_id: str) -> tuple[str, str]:
     # caller's provenance caption is simply omitted.
     summary = next((b.text for b in response.content if b.type == "text"), "")
     return summary, ""
+
+
+def summarise_pdf(pdf_bytes: bytes) -> tuple:
+    """
+    Summarises a PDF paper using Claude's native PDF reading capability.
+
+    Makes three sequential API calls:
+      1. Structured narrative summary (title, approach, findings, etc.)
+      2. Machine-readable info card as JSON (hypothesis, stats, limitations, etc.)
+      3. Per-figure interpretation — one call per extracted image (capped at 8)
+
+    Images are extracted via PyMuPDF; small images (≤150 px in either dimension)
+    are filtered out to skip logos, icons, and decorative elements.
+
+    Args:
+        pdf_bytes (bytes): Raw bytes of the uploaded PDF file.
+
+    Returns:
+        tuple: (summary, source_label, figures, info_card)
+            summary (str): Markdown-formatted narrative summary.
+            source_label (str): Provenance string for display in the UI.
+            figures (list[dict]): Each dict has keys:
+                bytes  (bytes) — raw image bytes
+                ext    (str)   — file extension, e.g. 'png'
+                interpretation (str) — Claude's 2-3 sentence description
+            info_card (dict): Structured fields extracted from the paper:
+                title, authors, journal, year, hypothesis, model_system,
+                sample_size, statistical_tests, key_findings, limitations,
+                datasets_tools, relevance_to_drug_discovery
+    """
+    import fitz  # PyMuPDF — imported here so it's an optional dependency
+
+    # ── Extract images from PDF ───────────────────────────────────────────────
+    # Open from a bytes stream rather than a file path so we never touch disk.
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    extracted_images = []
+    seen_xrefs: set = set()
+
+    for page in doc:
+        for img_ref in page.get_images():
+            xref = img_ref[0]
+            if xref in seen_xrefs:
+                continue
+            seen_xrefs.add(xref)
+            img_data = doc.extract_image(xref)
+            width = img_data["width"]
+            height = img_data["height"]
+            # Skip small images — logos, icons, and decorative elements are
+            # typically under 150 px in either dimension.
+            if width > 150 and height > 150:
+                extracted_images.append({
+                    "bytes": img_data["image"],
+                    "ext": img_data["ext"],
+                    "width": width,
+                    "height": height,
+                })
+
+    # Cap at 8 figures to avoid excessive API calls and token usage.
+    extracted_images = extracted_images[:8]
+
+    # ── Encode PDF as base64 for the Claude API ───────────────────────────────
+    pdf_base64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+
+    # Reusable document block — passed to both summary and card API calls so
+    # we don't have to re-encode for each call.
+    pdf_block = {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": pdf_base64,
+        },
+    }
+
+    # ── API CALL 1: Narrative summary ─────────────────────────────────────────
+    summary_response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1500,
+        system=(
+            "You are a research assistant helping a computational biologist "
+            "understand scientific papers. Be precise and structured."
+        ),
+        messages=[{
+            "role": "user",
+            "content": [
+                pdf_block,
+                {
+                    "type": "text",
+                    "text": (
+                        "Provide a structured summary with exactly these sections:\n\n"
+                        "**Title:**\n"
+                        "**Authors:**\n"
+                        "**Journal & Year:**\n\n"
+                        "**Problem addressed:**\n"
+                        "What gap or question does this paper tackle?\n\n"
+                        "**Approach:**\n"
+                        "What methods, datasets, and experimental systems?\n\n"
+                        "**Key findings:**\n"
+                        "What did they find? Be specific with numbers.\n\n"
+                        "**Figures worth noting:**\n"
+                        "Which figures best support the main claims?\n\n"
+                        "**Limitations:**\n"
+                        "Main weaknesses or caveats.\n\n"
+                        "**Relevance to drug discovery or computational biology:**\n"
+                        "Why does this matter?"
+                    ),
+                },
+            ],
+        }],
+    )
+
+    summary = next(
+        (b.text for b in summary_response.content if b.type == "text"),
+        "Unable to generate summary.",
+    )
+
+    # ── API CALL 2: Structured info card as JSON ──────────────────────────────
+    # The system prompt explicitly forbids markdown wrapping so we can parse
+    # the response directly with json.loads() without stripping fences.
+    card_response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1000,
+        system=(
+            "You are a precise data extractor. "
+            "Return only valid JSON. No markdown, no backticks, no preamble."
+        ),
+        messages=[{
+            "role": "user",
+            "content": [
+                pdf_block,
+                {
+                    "type": "text",
+                    "text": (
+                        "Extract structured information. Return ONLY this JSON object:\n"
+                        "{\n"
+                        '    "title": "full paper title",\n'
+                        '    "authors": "author list",\n'
+                        '    "journal": "journal name",\n'
+                        '    "year": "publication year",\n'
+                        '    "hypothesis": "one sentence central hypothesis",\n'
+                        '    "model_system": "cell lines, organisms, cohorts used",\n'
+                        '    "sample_size": "key sample sizes",\n'
+                        '    "statistical_tests": ["method1", "method2"],\n'
+                        '    "key_findings": ["finding1", "finding2", "finding3"],\n'
+                        '    "limitations": ["limitation1", "limitation2"],\n'
+                        '    "datasets_tools": ["dataset1", "tool1"],\n'
+                        '    "relevance_to_drug_discovery": "one sentence"\n'
+                        "}"
+                    ),
+                },
+            ],
+        }],
+    )
+
+    card_text = next(
+        (b.text for b in card_response.content if b.type == "text"),
+        "{}",
+    )
+
+    # Strip accidental markdown fences if Claude added them despite instructions.
+    card_text = card_text.strip()
+    if card_text.startswith("```"):
+        card_text = card_text.split("\n", 1)[1]
+        card_text = card_text.rsplit("```", 1)[0]
+
+    try:
+        info_card = json.loads(card_text)
+    except json.JSONDecodeError:
+        info_card = {}
+
+    # ── API CALL 3: Per-figure interpretations ────────────────────────────────
+    # One call per extracted image. Errors are caught individually so a bad
+    # image doesn't abort interpretation of the remaining figures.
+    for img in extracted_images:
+        img_base64 = base64.standard_b64encode(img["bytes"]).decode("utf-8")
+
+        # Normalise 'jpg' to 'jpeg' to satisfy the API media type spec.
+        ext = img["ext"]
+        media_type = "image/jpeg" if ext == "jpg" else f"image/{ext}"
+
+        try:
+            fig_response = client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=200,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": img_base64,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "This is a figure from a scientific paper. "
+                                "In 2-3 sentences: what does it show, what is the "
+                                "key pattern or finding, and what biological or "
+                                "statistical insight does it provide?"
+                            ),
+                        },
+                    ],
+                }],
+            )
+            img["interpretation"] = next(
+                (b.text for b in fig_response.content if b.type == "text"),
+                "Unable to interpret figure.",
+            )
+        except Exception:
+            img["interpretation"] = "Figure interpretation unavailable."
+
+    return (
+        summary,
+        "[Source: User uploaded PDF]",
+        extracted_images,
+        info_card,
+    )
 
 
 def main():
