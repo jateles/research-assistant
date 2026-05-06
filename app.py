@@ -39,6 +39,7 @@ from landscape_agent import (
     literature_scout,
     relevance_ranker,
     check_full_text_batch,
+    synthesis_agent,
 )
 
 # Initialise the Anthropic client once at module level. Streamlit re-imports
@@ -1463,10 +1464,162 @@ elif mode == "Literature landscape":
                 st.rerun()
 
     # ──────────────────────────────────────────────────────────────────────────
-    # STEP 4: Placeholder — Synthesis Agent coming in Session 3
+    # STEP 4: Landscape report — synthesis_agent runs here
+    # The report is cached in session state so it survives reruns.
+    # A follow-up chat interface lets the user ask questions about the report.
     # ──────────────────────────────────────────────────────────────────────────
     elif st.session_state.landscape_step == 4:
-        st.info("Synthesis Agent coming in Session 3.")
-        if st.button("← Back to paper selection"):
-            st.session_state.landscape_step = 3
+
+        anchor = st.session_state.landscape_anchor
+        candidates = st.session_state.get("landscape_candidates", [])
+        manual_papers = st.session_state.get("manual_papers", [])
+        selected_pmids = st.session_state.get("selected_pmids", set())
+        paper_pdfs = st.session_state.get("paper_pdfs", {})
+
+        # Merge ranked candidates and manually added papers, then filter
+        # to only those the user selected in Step 3.
+        all_papers = candidates + manual_papers
+        selected_papers = [
+            p for p in all_papers if p["pmid"] in selected_pmids
+        ]
+
+        # Run synthesis_agent once; cache result so the API call doesn't
+        # re-fire on every Streamlit rerun triggered by widgets below.
+        if "landscape_report" not in st.session_state:
+
+            with st.status(
+                "Generating landscape...",
+                expanded=True,
+            ) as status:
+
+                st.write(
+                    f"Fetching content for "
+                    f"{len(selected_papers)} papers..."
+                )
+
+                landscape = synthesis_agent(
+                    anchor=anchor,
+                    selected_papers=selected_papers,
+                    paper_pdfs=paper_pdfs,
+                )
+
+                status.update(
+                    label="Landscape complete",
+                    state="complete",
+                )
+
+            st.session_state.landscape_report = landscape
+
+        landscape = st.session_state.landscape_report
+
+        # ── Header ────────────────────────────────────────────────────────
+        st.markdown("## Literature landscape")
+        st.caption(
+            f"Based on {len(selected_papers)} papers · "
+            f"Anchor: {anchor.get('core_question', '')[:80]}..."
+        )
+
+        # ── Download + back buttons ───────────────────────────────────────
+        col_md, col_back = st.columns([2, 1])
+
+        with col_md:
+            st.download_button(
+                label="Download as markdown",
+                data=landscape,
+                file_name="literature_landscape.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+
+        with col_back:
+            if st.button("← Back to papers", use_container_width=True):
+                # Clear cached report so synthesis_agent reruns if the
+                # user changes their paper selection and returns here.
+                if "landscape_report" in st.session_state:
+                    del st.session_state.landscape_report
+                st.session_state.landscape_step = 3
+                st.rerun()
+
+        st.markdown("---")
+
+        # ── Landscape report ──────────────────────────────────────────────
+        st.markdown(landscape)
+
+        st.markdown("---")
+
+        # ── Follow-up chat ────────────────────────────────────────────────
+        # Seed messages (index 0-1) prime the conversation with the anchor
+        # question and the full report so Claude has complete context.
+        # Chat history (index 2+) is rendered as chat bubbles below.
+        st.markdown("### Ask a follow-up question")
+        st.caption(
+            "Ask about the landscape, specific papers, or what to read next"
+        )
+
+        if "landscape_messages" not in st.session_state:
+            st.session_state.landscape_messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        f"I have just read a literature landscape report "
+                        f"on this question: "
+                        f"{anchor.get('core_question', '')}"
+                    ),
+                },
+                {
+                    "role": "assistant",
+                    "content": landscape,
+                },
+            ]
+
+        # Render follow-up turns only — seed messages shown via st.markdown above.
+        for msg in st.session_state.landscape_messages[2:]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        if prompt := st.chat_input("Ask about this landscape..."):
+            st.session_state.landscape_messages.append(
+                {"role": "user", "content": prompt}
+            )
+
+            chat_response = _client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=1000,
+                system=(
+                    "You are a research assistant helping a scientist "
+                    "understand a literature landscape. Answer questions "
+                    "about the papers, findings, and field based on the "
+                    "landscape report in the conversation history."
+                ),
+                messages=st.session_state.landscape_messages,
+            )
+
+            answer = next(
+                (b.text for b in chat_response.content if b.type == "text"),
+                "Unable to generate response.",
+            )
+
+            st.session_state.landscape_messages.append(
+                {"role": "assistant", "content": answer}
+            )
+            st.rerun()
+
+        # ── Start over ────────────────────────────────────────────────────
+        st.markdown("---")
+        if st.button("Start new landscape", use_container_width=True):
+            # Wipe all landscape session state so the user starts fresh
+            # at Step 1 with no cached anchor, candidates, or report.
+            for key in [
+                "landscape_step",
+                "landscape_anchor",
+                "landscape_input",
+                "landscape_candidates",
+                "landscape_report",
+                "landscape_messages",
+                "selected_pmids",
+                "manual_papers",
+                "paper_pdfs",
+            ]:
+                if key in st.session_state:
+                    del st.session_state[key]
             st.rerun()

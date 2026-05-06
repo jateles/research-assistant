@@ -918,41 +918,149 @@ def relevance_ranker(candidates: list, anchor: dict) -> list:
     return sorted(candidates, key=lambda p: p["relevance_score"], reverse=True)
 
 
-def synthesis_agent(anchor: dict, selected_papers: list) -> str:
+def synthesis_agent(
+    anchor: dict,
+    selected_papers: list[dict],
+    paper_pdfs: dict,
+) -> str:
     """
-    Agent 3: Generates the structured literature landscape report.
+    Agent 3: Generates a structured literature landscape report from
+    selected papers and the anchor document.
 
-    Uses the anchor document as the organising frame and synthesises the
-    selected papers into a six-section markdown report:
+    For each selected paper, fetches the richest available content in
+    priority order:
+      1. Uploaded PDF (richest — includes figures and full structure)
+      2. PMC full text (good — complete article text)
+      3. Abstract (fallback — limited but always available)
 
-      1. Context        — Why this question matters; state of the field.
-      2. Contributions  — What the selected papers collectively establish.
-      3. Built upon     — Foundational work these papers cite and extend.
-      4. Parallel work  — Contemporary approaches tackling the same question.
-      5. Open questions — Gaps, contradictions, and unresolved debates.
-      6. Reading order  — Recommended sequence for a newcomer to the field.
-
-    The anchor's key_debates drive the "Open questions" section; the anchor's
-    core_question frames the "Context" section.
+    All paper content is assembled into a single Claude API call with
+    the anchor as the organising frame, producing a six-section markdown
+    report structured around the anchor's core question and key debates.
 
     Args:
-        anchor (dict):              Confirmed anchor document from anchor_builder(),
-                                    containing core_question, field_scope, and
-                                    key_debates.
-        selected_papers (list[dict]): User-curated final paper list. Each dict
-                                      should include pmid, title, authors, year,
-                                      and a summary text field attached by the
-                                      pipeline before this agent is called.
+        anchor (dict):              Confirmed anchor document with
+                                    core_question, field_scope,
+                                    key_debates, detected_pmid.
+        selected_papers (list[dict]): Curated paper list, each with
+                                    pmid, title, relationship,
+                                    has_full_text, full_text_status.
+        paper_pdfs (dict):          pmid → pdf bytes for any papers
+                                    where the user uploaded a PDF.
 
     Returns:
-        str: Structured markdown landscape report ready for display in the UI
-             or export as a document.
-
-    NOTE: Stub implementation — returns a placeholder string.
-    Full implementation planned for Session 3.
+        str: Structured markdown landscape report ready for display
+             in the UI or export as a document.
     """
-    # TODO: Session 3 — build a prompt that includes the anchor document and
-    # all selected paper summaries, then ask Claude to produce the six-section
-    # landscape report using the anchor's core_question and key_debates as
-    # the organising frame.
-    return "## Literature landscape\n\nSynthesis coming in Session 3."
+    from research_agent import fetch_full_text, fetch_abstract
+
+    # ── Step 1: Fetch the richest available content for each paper ────────
+    context_parts = []
+
+    for paper in selected_papers:
+        pmid = paper["pmid"]
+        title = paper["title"]
+        relationship = paper["relationship"]
+
+        # Priority 1: user-uploaded PDF — summarise_pdf extracts structured
+        # content including figures that plain-text routes would miss.
+        if pmid in paper_pdfs and paper_pdfs[pmid]:
+            try:
+                from research_agent import summarise_pdf
+                summary, _, _, _ = summarise_pdf(paper_pdfs[pmid])
+                content = summary
+                source = "uploaded PDF"
+            except Exception:
+                content = fetch_abstract(pmid)
+                source = "abstract (PDF processing failed)"
+
+        # Priority 2: PMC full text — complete article via eutils efetch.
+        elif paper.get("has_full_text"):
+            try:
+                content = fetch_full_text(pmid)
+                source = "full text"
+            except Exception:
+                content = fetch_abstract(pmid)
+                source = "abstract (full text fetch failed)"
+
+        # Priority 3: abstract fallback — always available from PubMed.
+        else:
+            content = fetch_abstract(pmid)
+            source = "abstract"
+
+        # Truncate to 2000 chars to manage context window — long enough for
+        # key content, short enough to fit many papers in a single API call.
+        if len(content) > 2000:
+            content = content[:2000] + "...[truncated]"
+
+        context_parts.append(
+            f"PAPER: {title}\n"
+            f"PMID: {pmid}\n"
+            f"RELATIONSHIP TO ANCHOR: {relationship}\n"
+            f"SOURCE: {source}\n"
+            f"CONTENT:\n{content}"
+        )
+
+    full_context = "\n\n---\n\n".join(context_parts)
+
+    # Format key debates as a bullet list for the prompt.
+    debates_str = "\n".join(
+        f"- {d}" for d in anchor.get("key_debates", [])
+    )
+
+    # ── Step 2: Single Claude call to synthesise the landscape ────────────
+    # The anchor is the organising frame, not just context — every section
+    # of the report is written through the lens of the core_question.
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=3000,
+        system=(
+            "You are a research synthesis expert helping a scientist "
+            "understand the literature landscape around a specific "
+            "research question.\n\n"
+            "Write in clear, precise scientific prose. Be specific — "
+            "name papers, authors, and findings. Avoid vague generalities. "
+            "Structure your response with markdown headers exactly as requested."
+        ),
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Synthesise a literature landscape from the papers below.\n\n"
+                f"ANCHOR QUESTION: {anchor.get('core_question', '')}\n"
+                f"FIELD SCOPE: {anchor.get('field_scope', '')}\n"
+                f"KEY DEBATES:\n{debates_str}\n\n"
+                f"PAPERS ({len(selected_papers)} total):\n\n"
+                f"{full_context}\n\n"
+                "Generate a structured landscape report with EXACTLY these "
+                "six sections in this order. Use these exact markdown headers:\n\n"
+                "## Context: what this field builds on\n"
+                "Summarise the foundational work these papers collectively build "
+                "on. What were the key prior findings and methods? Be specific — "
+                "name the foundational contributions.\n\n"
+                "## Central contribution\n"
+                "What is the central advance represented by the anchor paper and "
+                "closely related work? What gap did it fill? What was genuinely new?\n\n"
+                "## What has been built on it\n"
+                "Which papers cite or extend the anchor work? What did they add, "
+                "modify, or challenge? How has the field moved forward?\n\n"
+                "## Parallel approaches\n"
+                "What other approaches address the same core question? How do they "
+                "differ methodologically or conceptually? What are the tradeoffs "
+                "between approaches?\n\n"
+                "## Open questions\n"
+                "What remains unresolved? What are the key limitations of current "
+                "work? What would the most important next experiment or analysis be?\n\n"
+                "## Recommended reading order\n"
+                "List 4-6 papers from those provided in the order a new reader "
+                "should encounter them to build understanding progressively. For "
+                "each paper give one sentence on why it comes at that point in "
+                "the sequence.\n\n"
+                "Write in flowing prose within each section. Be specific and cite "
+                "paper titles and authors. Do not add any sections beyond these six."
+            ),
+        }],
+    )
+
+    return next(
+        (b.text for b in response.content if b.type == "text"),
+        "Unable to generate landscape report.",
+    )
