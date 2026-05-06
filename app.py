@@ -34,7 +34,12 @@ import anthropic
 import fitz  # PyMuPDF — used only to check availability; extraction is in research_agent
 from fpdf import FPDF
 from research_agent import run_agent, summarise_pdf, get_pmcid
-from landscape_agent import anchor_builder, literature_scout, relevance_ranker
+from landscape_agent import (
+    anchor_builder,
+    literature_scout,
+    relevance_ranker,
+    check_full_text_batch,
+)
 
 # Initialise the Anthropic client once at module level. Streamlit re-imports
 # this module on each run, but Python's module cache means this line only
@@ -1044,7 +1049,6 @@ elif mode == "Literature landscape":
                 # Deferred full-text check — only verify the top 20 ranked
                 # papers rather than all candidates to keep latency acceptable.
                 st.write("Checking full text availability...")
-                from landscape_agent import check_full_text_batch
                 ranked_checked = check_full_text_batch(ranked[:20])
                 for i, paper in enumerate(ranked_checked):
                     ranked[i] = paper
