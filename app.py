@@ -1045,7 +1045,9 @@ elif mode == "Literature landscape":
                 # papers rather than all candidates to keep latency acceptable.
                 st.write("Checking full text availability...")
                 from landscape_agent import check_full_text_batch
-                ranked = check_full_text_batch(ranked[:20])
+                ranked_checked = check_full_text_batch(ranked[:20])
+                for i, paper in enumerate(ranked_checked):
+                    ranked[i] = paper
 
                 status.update(
                     label=f"Found {len(ranked)} relevant papers",
@@ -1147,11 +1149,19 @@ elif mode == "Literature landscape":
                         st.progress(score / 100)
 
                     with col_ft:
-                        if paper.get("has_full_text"):
+                        status = paper.get("full_text_status", "unknown")
+
+                        if status == "available":
                             st.caption("📄 Full text available")
                             upload_label = "Upload PDF for richer analysis"
-                        else:
+                        elif status == "unavailable":
                             st.caption("📋 Abstract only")
+                            upload_label = "Upload PDF"
+                        else:
+                            st.caption(
+                                "📋 Full text status unknown — "
+                                "upload PDF if available"
+                            )
                             upload_label = "Upload PDF"
 
                         uploaded_pdf = st.file_uploader(
@@ -1216,11 +1226,19 @@ elif mode == "Literature landscape":
                                 st.progress(score / 100)
 
                             with col_ft:
-                                if paper.get("has_full_text"):
+                                status = paper.get("full_text_status", "unknown")
+
+                                if status == "available":
                                     st.caption("📄 Full text available")
                                     upload_label = "Upload PDF for richer analysis"
-                                else:
+                                elif status == "unavailable":
                                     st.caption("📋 Abstract only")
+                                    upload_label = "Upload PDF"
+                                else:
+                                    st.caption(
+                                        "📋 Full text status unknown — "
+                                        "upload PDF if available"
+                                    )
                                     upload_label = "Upload PDF"
 
                                 uploaded_pdf = st.file_uploader(
@@ -1261,10 +1279,23 @@ elif mode == "Literature landscape":
                             st.caption(
                                 f"{paper.get('authors', '')} · Added manually"
                             )
+                        status = paper.get("full_text_status", "unknown")
+
+                        if status == "available":
+                            st.caption("📄 Full text available")
+                            upload_label = "Upload PDF for richer analysis"
+                        elif status == "unavailable":
+                            st.caption("📋 Abstract only")
+                            upload_label = "Upload PDF"
+                        else:
+                            st.caption(
+                                "📋 Full text status unknown — "
+                                "upload PDF if available"
+                            )
+                            upload_label = "Upload PDF"
+
                         uploaded_pdf = st.file_uploader(
-                            "Upload PDF for richer analysis"
-                            if paper.get("has_full_text")
-                            else "Upload PDF",
+                            upload_label,
                             type="pdf",
                             key=f"pdf_manual_{pmid}",
                             label_visibility="collapsed",

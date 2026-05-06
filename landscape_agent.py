@@ -647,10 +647,23 @@ def check_full_text_batch(papers: list[dict]) -> list[dict]:
         list[dict]: The same dicts with has_full_text (bool) and pmcid
                     (str or None) updated in place.
     """
+    def check_one(paper):
+        try:
+            pmcid = get_pmcid(paper["pmid"])
+            paper["has_full_text"] = pmcid is not None
+            paper["pmcid"] = pmcid
+            paper["full_text_status"] = (
+                "available" if pmcid is not None
+                else "unavailable"
+            )
+        except Exception:
+            paper["has_full_text"] = False
+            paper["pmcid"] = None
+            paper["full_text_status"] = "unknown"
+        return paper
+
     for paper in papers:
-        pmcid = get_pmcid(paper["pmid"])
-        paper["pmcid"] = pmcid
-        paper["has_full_text"] = pmcid is not None
+        check_one(paper)
     return papers
 
 

@@ -69,41 +69,46 @@ def fetch_abstract(pubmed_id: str) -> str:
     return response.text
 
 
-def get_pmcid(pmid: str):
+def get_pmcid(pmid: str) -> str | None:
     """
-    Resolves a PubMed ID (PMID) to its PubMed Central ID (PMCID) if one exists.
+    Checks whether a paper has full text in PubMed Central.
 
-    Not every PubMed paper has a free full-text deposit in PMC. This function
-    uses the elink API to check whether a PMC record is linked to the given
-    PMID, returning None when no link is found so callers can fall back to the
-    abstract.
+    Uses PMC esearch API which is significantly faster than
+    the elink API. Searches PMC database directly for the
+    given PMID and returns the PMCID if found.
 
     Args:
-        pmid (str): The PubMed ID to look up, e.g. "37651234".
+        pmid (str): PubMed ID to check
 
     Returns:
-        str | None: The PMCID as a plain string (digits only, without the
-                    "PMC" prefix) if one is linked, otherwise None.
-
-    Example return: "10456789"
+        str: PMCID e.g. "PMC3749951" if found
+        None: if not in PMC or request fails
     """
-    try:
-        # Query the elink endpoint, asking it to translate from the pubmed
-        # database to the pmc database for this PMID.
-        response = requests.get(
-            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi",
-            params={"dbfrom": "pubmed", "db": "pmc", "id": pmid, "retmode": "json"},
-        )
-        data = response.json()
+    url = (
+        "https://eutils.ncbi.nlm.nih.gov"
+        "/entrez/eutils/esearch.fcgi"
+    )
+    params = {
+        "db": "pmc",
+        "term": f"{pmid}[PMID]",
+        "retmode": "json",
+        "retmax": 1,
+    }
 
-        # Navigate the nested elink JSON structure to extract the first linked
-        # PMC ID. The path is: linksets[0] → linksetdbs[0] → links[0].
-        # Any of these levels may be absent if no PMC record is linked.
-        pmcid = data["linksets"][0]["linksetdbs"][0]["links"][0]
-        return str(pmcid)
+    try:
+        response = requests.get(url, params=params, timeout=8)
+        data = response.json()
+        ids = (
+            data
+            .get("esearchresult", {})
+            .get("idlist", [])
+        )
+        if ids:
+            # PMC IDs from esearch don't have PMC prefix —
+            # add it for consistency with rest of pipeline
+            return f"PMC{ids[0]}"
+        return None
     except Exception:
-        # Swallow all errors (KeyError, IndexError, JSONDecodeError, network
-        # failures) and return None so fetch_full_text can fall back cleanly.
         return None
 
 
