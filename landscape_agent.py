@@ -631,7 +631,10 @@ def pubmed_author_search(author_name: str, limit: int = 10) -> list[dict]:
     return results
 
 
-def check_full_text_batch(papers: list[dict]) -> list[dict]:
+def check_full_text_batch(
+    papers: list[dict],
+    batch_size: int = 20,
+) -> list[dict]:
     """
     Refreshes PMC full-text availability for a list of papers.
 
@@ -640,12 +643,17 @@ def check_full_text_batch(papers: list[dict]) -> list[dict]:
     this on all candidates during scouting would add too much latency; calling
     it on the ranked shortlist keeps the wait acceptable.
 
+    Papers are processed in batches of batch_size, each batch fully parallel
+    via ThreadPoolExecutor. With the default batch_size of 20 and max_workers
+    capped at 20, up to 20 PMC lookups run concurrently per batch.
+
     Args:
         papers (list[dict]): Normalised paper dicts, each with a "pmid" key.
+        batch_size (int):    Papers per parallel batch. Default 20.
 
     Returns:
-        list[dict]: The same dicts with has_full_text (bool) and pmcid
-                    (str or None) updated in place.
+        list[dict]: The same dicts with has_full_text (bool), pmcid
+                    (str or None), and full_text_status updated in place.
     """
     def check_one(paper):
         try:
@@ -662,9 +670,15 @@ def check_full_text_batch(papers: list[dict]) -> list[dict]:
             paper["full_text_status"] = "unknown"
         return paper
 
-    for paper in papers:
-        check_one(paper)
-    return papers
+    results = []
+    for i in range(0, len(papers), batch_size):
+        batch = papers[i : i + batch_size]
+        with ThreadPoolExecutor(
+            max_workers=min(len(batch), 20)
+        ) as ex:
+            batch_results = list(ex.map(check_one, batch))
+        results.extend(batch_results)
+    return results
 
 
 def literature_scout(anchor: dict) -> list:
